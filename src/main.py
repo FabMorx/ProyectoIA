@@ -30,7 +30,8 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).parent
 OUT_DIR = BASE_DIR / "salida"
-DEVICE = "cpu"
+USE_CUDA = torch.cuda.is_available()
+DEVICE = "cuda" if USE_CUDA else "cpu"
 
 LLM_ID = "Qwen/Qwen3-1.7B"
 IMG_ID = "Lykon/dreamshaper-8"
@@ -51,7 +52,20 @@ GENRE_VOICE = {
     "Infantil":        {"mix": {"ef_dora": 1.00},                   "speed": 0.95, "pause": 0.40},
 }
 
-TORCH_THREADS = max(1, min(8, os.cpu_count() or 2))
+MUSIC_ID = "facebook/musicgen-small"
+MUSIC_MAX_TOKENS = 750    # ~15s de audio a 50 Hz
+MUSIC_BG_GAIN = 0.14      # volumen de fondo relativo al RMS de la voz (~-17 dB)
+
+GENRE_MUSIC = {
+    "Fantasía":        "cinematic fantasy orchestral soundtrack, soft harp, warm strings, gentle flute, ambient background music, calm, no vocals",
+    "Terror":          "dark gothic horror ambient soundtrack, eerie low cello drone, subtle haunting piano, suspenseful atmosphere, no vocals",
+    "Misterio":        "noir mystery ambient soundtrack, soft upright bass, muted piano chords, atmospheric rain mood, subtle, no vocals",
+    "Aventura":        "epic adventure orchestral soundtrack, warm brass, light acoustic guitar, uplifting strings, cinematic background music, no vocals",
+    "Ciencia ficción": "retro sci-fi ambient synth soundtrack, warm analog pads, gentle futuristic arpeggio, atmospheric space mood, no vocals",
+    "Infantil":        "gentle whimsical music box and acoustic strings soundtrack, warm playful lullaby melody, soft background music, no vocals",
+}
+
+TORCH_THREADS = max(1, min(10, os.cpu_count() or 2))
 torch.set_num_threads(TORCH_THREADS)
 
 N_SCENES = 5
@@ -60,8 +74,8 @@ IMG_REFINE_SIZE = 768
 IMG_UPSCALE = 2         
 
 
-IMG_STEPS = 6
-IMG_GUIDANCE = 1.0
+IMG_STEPS = 8
+IMG_GUIDANCE = 1.6
 
 IMG_REFINE_STEPS = 8
 IMG_REFINE_STRENGTH = 0.5
@@ -79,7 +93,7 @@ LLM_MAX_TOKENS = 5000
 NEGATIVE_PROMPT = (
     "ugly, deformed, noisy, blurry, distorted, low quality, "
     "bad anatomy, bad proportions, duplicate, watermark, "
-    "signature, text, cropped, extra limbs, missing limbs, 3d render, plastic"
+    "signature, text, cropped, extra limbs, missing limbs, 3d render, plastic, picture frame, border"
 )
 
 
@@ -96,8 +110,8 @@ STYLE_PROMPT = {
     "pintura digital": "digital painting, smooth shading, painterly brush strokes, vibrant colors, artstation",
     "acuarela": "watercolor painting, soft wet washes, paper texture, pigment bleeding, pastel tones, loose brushwork",
     "arte conceptual": "concept art, cinematic matte painting, epic scale, dramatic lighting, wide establishing shot",
-    "ilustración detallada": "detailed pen and ink illustration, intricate linework, fine hatching, crisp outlines, storybook engraving",
-    "estilo óleo clásico": "classic oil painting, thick impasto brush strokes, canvas texture, old masters, chiaroscuro lighting",
+    "ilustración detallada": "detailed pen and ink illustration, intricate linework, fine hatching, crisp outlines, detailed book art",
+    "estilo óleo clásico": "classic oil painting, thick impasto brush strokes, canvas texture, rich oil brushwork, chiaroscuro lighting",
 }
 
 STYLE_NEGATIVE = {
@@ -116,14 +130,14 @@ GENRES = {
         "symbol": "⚔️",
     },
     "Terror": {
-        "visual": "gothic horror illustration, dark moody painting, deep shadows, eerie fog, cinematic",
-        "mood": "gothic horror scene, deep shadows, eerie fog, dark moody atmosphere",
+        "visual": "dark horror illustration, moody painting, deep shadows, eerie fog, cinematic",
+        "mood": "dark horror scene, deep shadows, eerie fog, suspenseful atmosphere",
         "cover": "horror",
         "symbol": "💀",
     },
     "Misterio": {
-        "visual": "noir mystery illustration, foggy night, dramatic cinematic lighting, detailed painting",
-        "mood": "noir mystery scene, foggy night, dramatic cinematic lighting",
+        "visual": "mystery illustration, dramatic shadows, atmospheric fog, cinematic lighting, detailed painting",
+        "mood": "mystery scene, dramatic shadows, atmospheric mood, cinematic lighting",
         "cover": "mystery",
         "symbol": "🔍",
     },
@@ -134,13 +148,13 @@ GENRES = {
         "symbol": "🗺️",
     },
     "Ciencia ficción": {
-        "visual": "retro science fiction illustration, steampunk aesthetic, classic pulp sci-fi art",
-        "mood": "retro science fiction scene, steampunk aesthetic, pulp sci-fi mood",
+        "visual": "futuristic science fiction illustration, high-tech sci-fi art, holographic lighting",
+        "mood": "futuristic science fiction scene, high-tech sci-fi atmosphere, dramatic lighting",
         "cover": "scifi",
         "symbol": "👾",
     },
     "Infantil": {
-        "visual": "children's vintage picture book illustration, soft watercolor, cute, bright pastel colors",
+        "visual": "children's picture book illustration, soft watercolor, cute, bright pastel colors",
         "mood": "children's picture book scene, cute, bright pastel colors",
         "cover": "children",
         "symbol": "⭐",
@@ -1357,10 +1371,21 @@ def is_spanish(text: str) -> bool:
 def load_llm():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(LLM_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        LLM_ID,
-        torch_dtype=torch.float32
-    ).to(DEVICE)
+    if USE_CUDA:
+        # Hibrido GPU + CPU: prioriza VRAM disponible (~2.9 GB para RTX 2050 4 GB)
+        # y descarga el resto de capas a RAM/CPU automaticamente via accelerate.
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            max_memory={0: "2900MiB", "cpu": "16GiB"},
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_ID,
+            torch_dtype=torch.float32,
+        ).to("cpu")
     model.eval()
     return tok, model
 
@@ -1368,27 +1393,34 @@ def load_llm():
 @st.cache_resource(show_spinner=False)
 def load_image_pipe():
     from diffusers import AutoPipelineForText2Image, LCMScheduler
+    dtype = torch.float16 if USE_CUDA else torch.float32
     pipe = AutoPipelineForText2Image.from_pretrained(
         IMG_ID,
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
         use_safetensors=True
-    ).to(DEVICE)
+    )
 
-    # LCM-LoRA acelera la generación en CPU (pocos pasos).
-    # Requiere la librería "peft": uv pip install peft
+    # LCM-LoRA acelera la generación (pocos pasos).
+    # Requiere la librería "peft".
     try:
         pipe.load_lora_weights(LCM_LORA_ID)
         pipe.fuse_lora()
-        # <-- CAMBIO A: el LoRA LCM SOLO funciona bien con LCMScheduler.
-        #     Sin esto salían imágenes ruidosas/con artefactos.
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     except Exception:
         # Recarga limpia (sin LoRA a medias) y scheduler original
         pipe = AutoPipelineForText2Image.from_pretrained(
             IMG_ID,
-            torch_dtype=torch.float32,
+            torch_dtype=dtype,
             use_safetensors=True
-        ).to(DEVICE)
+        )
+
+    if USE_CUDA:
+        # Offload CPU<->GPU: mantiene submodelos inactivos en RAM y mueve a VRAM solo el activo.
+        pipe.enable_model_cpu_offload()
+        if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+            pipe.vae.enable_slicing()
+    else:
+        pipe.to("cpu")
 
     pipe.enable_attention_slicing()
     pipe.set_progress_bar_config(disable=True)
@@ -1409,7 +1441,29 @@ def load_img2img_pipe():
 @st.cache_resource(show_spinner=False)
 def load_kokoro():
     from kokoro import KPipeline
-    return KPipeline(lang_code=KOKORO_LANG, device=DEVICE)
+    # Kokoro corre en CPU para ejecutarse en paralelo mientras la GPU genera las imagenes.
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        pipe = KPipeline(lang_code=KOKORO_LANG, device="cpu")
+        if getattr(pipe, "model", None) is not None:
+            pipe.model.float()
+        return pipe
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+
+@st.cache_resource(show_spinner=False)
+def load_musicgen():
+    from transformers import AutoProcessor, MusicgenForConditionalGeneration
+    dtype = torch.float16 if USE_CUDA else torch.float32
+    processor = AutoProcessor.from_pretrained(MUSIC_ID)
+    model = MusicgenForConditionalGeneration.from_pretrained(
+        MUSIC_ID,
+        torch_dtype=dtype,
+    ).to(DEVICE)
+    model.eval()
+    return processor, model
 
 
 # ====================
@@ -1538,32 +1592,114 @@ Responde solo con el párrafo."""
 JSON_PREFILL = '{\n  "title": "'
 
 
-def parse_outline(raw: str):
-    """JSON tolerante para la escaleta (bloques ```json, comas finales, etc.)."""
+def _repair_truncated_json(text: str) -> str:
+    """Cierra comillas, corchetes o llaves abiertas si el LLM se truncó."""
+    in_str = False
+    escape = False
+    stack = []
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch in "{[":
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]" and stack and stack[-1] == ch:
+                stack.pop()
+    repaired = text.rstrip().rstrip(",")
+    if in_str:
+        repaired += '"'
+    repaired += "".join(reversed(stack))
+    return re.sub(r",\s*([}\]])", r"\1", repaired)
+
+
+def _regex_extract_outline(text: str):
+    """Plan B si json.loads falla (p.ej. comillas sin escapar dentro de un texto)."""
+    def _field(name: str, src: str, default: str = "") -> str:
+        m = re.search(rf'"{name}"\s*:\s*"(.*?)"\s*(?:,|\n|\}})', src, re.DOTALL)
+        return m.group(1).replace('\\"', '"').strip() if m else default
+
+    scenes_pos = text.find('"scenes"')
+    head = text[:scenes_pos] if scenes_pos != -1 else text
+    body = text[scenes_pos:] if scenes_pos != -1 else text
+
+    pattern = re.compile(
+        r'\{\s*"title"\s*:\s*"(.*?)"\s*,\s*"action"\s*:\s*"(.*?)"\s*,\s*"summary"\s*:\s*"(.*?)"\s*\}',
+        re.DOTALL,
+    )
+    scenes = []
+    for t, a, s in pattern.findall(body):
+        t, a, s = t.strip(), a.strip(), s.strip()
+        if t and a and s:
+            scenes.append({"title": t, "action": a, "summary": s})
+    if not scenes:
+        return None
+    return {
+        "title": _field("title", head, scenes[0]["title"]),
+        "character": _field("character", head, "a focused human protagonist with distinctive features"),
+        "setting": _field("setting", head, "a mysterious atmospheric location"),
+        "scenes": scenes,
+    }
+
+
+def parse_outline(raw: str, allow_partial: bool = False):
+    """JSON tolerante + reparación de truncamientos + extracción por regex."""
     text = re.sub(r"```(?:json)?", "", raw)
     first = text.find("{")
     if first == -1:
         return None
     last = text.rfind("}")
-    text = text[first:last + 1] if last > first else text[first:]
-    candidate = re.sub(r",\s*([}\]])", r"\1", text)
-    try:
-        data = json.loads(candidate, strict=False)
-        scenes = data.get("scenes")
-        if not isinstance(scenes, list) or len(scenes) < N_SCENES:
-            return None
-        scenes = scenes[:N_SCENES]
-        for s in scenes:
-            for k in ("title", "action", "summary"):
-                if not str(s.get(k, "")).strip():
-                    return None
-        data["scenes"] = scenes
-        data.setdefault("title", str(scenes[0].get("title", "Relato")))
-        data.setdefault("character", "a focused human protagonist with distinctive features")
-        data.setdefault("setting", "a mysterious atmospheric location")
-        return data
-    except Exception:
+    sliced = text[first:last + 1] if last > first else text[first:]
+    candidate = re.sub(r",\s*([}\]])", r"\1", sliced)
+
+    data = None
+    for attempt in (candidate, _repair_truncated_json(text[first:])):
+        try:
+            data = json.loads(attempt, strict=False)
+            break
+        except Exception:
+            continue
+
+    if not isinstance(data, dict):
+        data = _regex_extract_outline(text[first:])
+    if not isinstance(data, dict):
         return None
+
+    raw_scenes = data.get("scenes")
+    if not isinstance(raw_scenes, list):
+        return None
+
+    scenes = []
+    for s in raw_scenes:
+        if not isinstance(s, dict):
+            continue
+        t = str(s.get("title", "")).strip()
+        a = str(s.get("action", "")).strip()
+        sm = str(s.get("summary", "")).strip()
+        if t and a and sm:
+            scenes.append({"title": t, "action": a, "summary": sm})
+
+    if len(scenes) < N_SCENES:
+        if not allow_partial or len(scenes) < 3:
+            return None
+        while len(scenes) < N_SCENES:
+            idx = len(scenes) + 1
+            scenes.append({
+                "title": f"Escena {idx}",
+                "action": scenes[-1]["action"],
+                "summary": f"Continuación directa tras {scenes[-1]['title'].lower()}, avanzando hacia el desenlace.",
+            })
+
+    data["scenes"] = scenes[:N_SCENES]
+    data.setdefault("title", str(scenes[0].get("title", "Relato")))
+    data.setdefault("character", "a focused human protagonist with distinctive features")
+    data.setdefault("setting", "a mysterious atmospheric location")
+    return data
 
 
 def _clean_prose(text: str) -> str:
@@ -1597,6 +1733,52 @@ def _make_streamer(tok, cb, every: int = 3):
     return _ProseStreamer()
 
 
+def _needs_english(text: str) -> bool:
+    """Detecta si un campo visual (que debe ir en inglés para CLIP) salió en español."""
+    if re.search(r"[áéíóúñü¿¡]", text.lower()):
+        return True
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    es_markers = {"el", "la", "los", "las", "un", "una", "con", "para", "por", "que", "su", "del", "en", "y"}
+    return len(words & es_markers) >= 2
+
+
+def _ensure_english_visual(tok, model, outline: dict) -> None:
+    """Si el LLM dejó character/setting/action en español, los traduce al inglés en 1 llamada."""
+    fields = [outline.get("character", ""), outline.get("setting", "")] + [
+        s.get("action", "") for s in outline["scenes"]
+    ]
+    if not any(_needs_english(f) for f in fields):
+        return
+
+    numbered = "\n".join(f"{idx + 1}. {val}" for idx, val in enumerate(fields))
+    msgs = [
+        {"role": "system", "content": "Translate each numbered line into a concise visual English phrase (max 14 words each) for Stable Diffusion. Keep the exact numbering 1..7 and output only the translated lines."},
+        {"role": "user", "content": numbered},
+    ]
+    try:
+        prompt = tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = tok([prompt], return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            out = model.generate(**inputs, max_new_tokens=280, do_sample=False)
+        raw = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        parsed = {}
+        for ln in raw.splitlines():
+            m = re.match(r"^\s*(\d+)[.)]\s*(.+)$", ln.strip())
+            if m:
+                parsed[int(m.group(1))] = m.group(2).strip().strip('"')
+        if 1 in parsed:
+            outline["character"] = parsed[1]
+        if 2 in parsed:
+            outline["setting"] = parsed[2]
+        for idx, sc in enumerate(outline["scenes"]):
+            if (idx + 3) in parsed:
+                sc["action"] = parsed[idx + 3]
+    except Exception:
+        pass
+
+
 def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
     """on_event(evento, i, dato) permite mostrar el libro formandose:
     'outline' (dato = escaleta), 'scene_start' (dato = titulo), 'scene_text' (dato = texto parcial
@@ -1608,8 +1790,9 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
     # ============ FASE 1: ESCALETA (una sola llamada, JSON pequeño) ============
     outline = None
     debug_lines = []
+    raw_attempts = []
 
-    for temp in (0.5, 0.7):
+    for temp in (0.5, 0.7, 0.3):
         try:
             prompt = tok.apply_chat_template(
                 build_outline_messages(idea, genre),
@@ -1618,11 +1801,11 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
                 enable_thinking=False,
             ) + JSON_PREFILL
 
-            inputs = tok([prompt], return_tensors="pt").to(DEVICE)
+            inputs = tok([prompt], return_tensors="pt").to(model.device)
             with torch.inference_mode():
                 out = model.generate(
                     **inputs,
-                    max_new_tokens=1200,     # la escaleta es corta
+                    max_new_tokens=1600,     # margen extra para evitar JSON truncado
                     do_sample=True,
                     temperature=temp,
                     top_p=0.9,
@@ -1632,6 +1815,7 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
             raw = JSON_PREFILL + tok.decode(
                 out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
             )
+            raw_attempts.append(raw)
             debug_lines.append(f"===== ESCALETA (temp={temp}) =====\n{raw}\n")
             outline = parse_outline(raw)
             if outline:
@@ -1641,12 +1825,20 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
             continue
 
     if not outline:
+        for raw in raw_attempts:
+            outline = parse_outline(raw, allow_partial=True)
+            if outline:
+                break
+
+    if not outline:
         try:
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             (OUT_DIR / "debug_llm_raw.txt").write_text("\n".join(debug_lines), encoding="utf-8")
         except Exception:
             pass
         return fallback_story(idea, genre), True
+
+    _ensure_english_visual(tok, model, outline)
 
     if on_event:
         on_event("outline", None, outline)
@@ -1657,6 +1849,7 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
 
     for i in range(N_SCENES):
         text = None
+        best_candidate = ""
         if on_event:
             on_event("scene_start", i, outline["scenes"][i]["title"])
 
@@ -1669,7 +1862,7 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
                     enable_thinking=False,
                 )
 
-                inputs = tok([prompt], return_tensors="pt").to(DEVICE)
+                inputs = tok([prompt], return_tensors="pt").to(model.device)
                 streamer = None
                 if on_event:
                     streamer = _make_streamer(
@@ -1688,6 +1881,8 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
                 candidate = _clean_prose(tok.decode(
                     out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
                 ))
+                if len(candidate.split()) > len(best_candidate.split()):
+                    best_candidate = candidate
 
                 # Aceptamos si se acerca al mínimo pedido (80%)
                 if len(candidate.split()) >= int(SCENE_WORDS_MIN * 0.8):
@@ -1697,6 +1892,28 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
             except Exception:
                 debug_lines.append(f"===== ESCENA {i+1} ERROR =====\n{traceback.format_exc()}\n")
                 continue
+
+        if text is None and len(best_candidate.split()) >= 50:
+            # En lugar de descartar toda la historia, ampliamos o aceptamos el mejor intento.
+            try:
+                ext_msgs = [
+                    {"role": "system", "content": "Eres un escritor literario en español. Continúa el párrafo de forma fluida con 60 a 80 palabras más, sin repetir lo anterior."},
+                    {"role": "user", "content": f"Texto actual:\n{best_candidate}\n\nContinúa directamente desde la última frase:"},
+                ]
+                ext_prompt = tok.apply_chat_template(
+                    ext_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
+                ext_inputs = tok([ext_prompt], return_tensors="pt").to(model.device)
+                with torch.inference_mode():
+                    ext_out = model.generate(
+                        **ext_inputs, max_new_tokens=220, do_sample=True, temperature=0.7, top_p=0.9
+                    )
+                extra = _clean_prose(tok.decode(
+                    ext_out[0][ext_inputs["input_ids"].shape[1]:], skip_special_tokens=True
+                ))
+                text = f"{best_candidate} {extra}".strip() if extra else best_candidate
+            except Exception:
+                text = best_candidate
 
         if text is None:
             # Escena irrecuperable: usamos el relato de contingencia completo
@@ -1716,6 +1933,12 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
             on_event("scene_done", i, scenes[-1])
         # Contexto para la siguiente escena: final de la actual
         prev_ending = text[-220:]
+
+    if USE_CUDA:
+        # Libera la VRAM ocupada por el LLM antes de cargar Stable Diffusion (4 GB VRAM).
+        del model
+        load_llm.clear()
+        free_memory()
 
     return {
         "title": outline["title"],
@@ -1799,16 +2022,18 @@ def generate_scene_images(story: dict, genre: str, style: str, progress_cb,
 
     for i, scene in enumerate(story["scenes"], 1):
         
+        style_short = STYLE_EN.get(style, "digital painting")
         prompt = build_image_prompt(pipe, [
-            style_prompt,            # el estilo elegido manda: va primero
+            style_short,             # etiqueta breve de estilo para no gastar los 77 tokens
             scene["action"],
-            story["character"],
             mood,
             story["setting"],
+            story["character"],
+            style_prompt,
             "highly detailed",
         ])
 
-        generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
+        generator = torch.Generator(device="cpu").manual_seed(IMG_SEED + i * 150)
 
         # --- FASE 1: generación base con LCM (con vista previa en cada paso) ---
         base_kwargs = dict(
@@ -1840,7 +2065,7 @@ def generate_scene_images(story: dict, genre: str, style: str, progress_cb,
                     raise
                 base_kwargs.pop("callback_on_step_end", None)
                 base_kwargs.pop("callback_on_step_end_tensor_inputs", None)
-                generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
+                generator = torch.Generator(device="cpu").manual_seed(IMG_SEED + i * 150)
                 base_kwargs["generator"] = generator
                 base = pipe(**base_kwargs).images[0]
 
@@ -1850,7 +2075,7 @@ def generate_scene_images(story: dict, genre: str, style: str, progress_cb,
         # --- FASE 2: refinado img2img a mayor resolución.
         try:
             base_up = base.resize((IMG_REFINE_SIZE, IMG_REFINE_SIZE), resample=Image.LANCZOS)
-            ref_generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
+            ref_generator = torch.Generator(device="cpu").manual_seed(IMG_SEED + i * 150)
             with torch.inference_mode():
                 refined = img2img(
                     prompt=prompt,
@@ -1880,6 +2105,7 @@ def generate_scene_images(story: dict, genre: str, style: str, progress_cb,
         except Exception:
             pass
 
+    free_memory()
     return paths
 
 # ============================================================
@@ -1938,6 +2164,115 @@ def generate_narrations(story: dict, progress_cb, genre: str = "Fantasía") -> l
         progress_cb(i, path)
 
     return paths
+
+
+# ============================================================
+# 4. MÚSICA DE FONDO (MUSICGEN) + MEZCLA CON NARRACIÓN
+# ============================================================
+
+def generate_background_music(story: dict, genre: str):
+    """Genera una pista instrumental de fondo acorde al género y escenario."""
+    processor, model = load_musicgen()
+    base_prompt = GENRE_MUSIC.get(genre, GENRE_MUSIC["Fantasía"])
+    setting = str(story.get("setting", "")).strip()
+    prompt = f"{base_prompt}, {setting}" if setting else base_prompt
+
+    inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
+    with torch.inference_mode():
+        audio_values = model.generate(**inputs, max_new_tokens=MUSIC_MAX_TOKENS)
+
+    sr = int(getattr(model.config.audio_encoder, "sampling_rate", 32000))
+    audio = audio_values[0, 0].detach().float().cpu().numpy().reshape(-1)
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1e-6:
+        audio = (audio / peak) * 0.9
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / "musica_fondo.wav"
+    sf.write(str(path), audio.astype(np.float32), sr, subtype="PCM_16")
+
+    if USE_CUDA:
+        # Libera la VRAM de MusicGen para mantener limpia la GPU de 4 GB.
+        del model
+        load_musicgen.clear()
+        free_memory()
+
+    return path
+
+
+def _loop_with_crossfade(track: np.ndarray, target_len: int, sr: int, fade_sec: float = 1.0) -> np.ndarray:
+    """Extiende una pista musical al largo objetivo usando crossfade suave."""
+    if len(track) >= target_len:
+        return track[:target_len].copy()
+
+    fade = min(int(sr * fade_sec), len(track) // 4)
+    if fade <= 0:
+        reps = int(np.ceil(target_len / max(1, len(track))))
+        return np.tile(track, reps)[:target_len]
+
+    step = len(track) - fade
+    out = np.zeros(target_len + len(track), dtype=np.float32)
+    win_in = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+    win_out = 1.0 - win_in
+
+    pos = 0
+    first = True
+    while pos < target_len:
+        chunk = track.copy()
+        if not first:
+            chunk[:fade] *= win_in
+            out[pos:pos + fade] *= win_out
+        out[pos:pos + len(chunk)] += chunk
+        pos += step
+        first = False
+    return out[:target_len]
+
+
+def mix_narration_with_music(voice_paths: list[Path], music_path: Path, bg_gain: float = MUSIC_BG_GAIN) -> None:
+    """Mezcla la música de fondo (a volumen bajo) detrás de cada narración."""
+    from scipy.signal import resample_poly
+    from math import gcd
+
+    music_raw, m_sr = sf.read(str(music_path), dtype="float32")
+    if music_raw.ndim > 1:
+        music_raw = music_raw.mean(axis=1)
+
+    target_sr = 24000
+    if m_sr != target_sr:
+        g = gcd(target_sr, int(m_sr))
+        music_24k = resample_poly(music_raw, target_sr // g, int(m_sr) // g).astype(np.float32)
+    else:
+        music_24k = music_raw.astype(np.float32)
+
+    music_rms = float(np.sqrt(np.mean(music_24k ** 2))) or 1e-4
+
+    for vpath in voice_paths:
+        voice, v_sr = sf.read(str(vpath), dtype="float32")
+        if voice.ndim > 1:
+            voice = voice.mean(axis=1)
+        if not voice.size:
+            continue
+
+        bg = _loop_with_crossfade(music_24k, len(voice), int(v_sr))
+
+        # Fade-in y fade-out suaves al inicio y final de la escena
+        fi = min(int(v_sr * 0.8), len(bg) // 4)
+        fo = min(int(v_sr * 1.2), len(bg) // 4)
+        if fi > 0:
+            bg[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
+        if fo > 0:
+            bg[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
+
+        # Escala la música en función del RMS de la voz para que quede siempre de fondo
+        voice_rms = float(np.sqrt(np.mean(voice ** 2))) or 0.05
+        scaled_bg = bg * ((voice_rms * bg_gain) / music_rms)
+
+        mixed = voice + scaled_bg
+        peak = float(np.max(np.abs(mixed)))
+        if peak > 0.98:
+            mixed = mixed * (0.98 / peak)
+
+        sf.write(str(vpath), mixed.astype(np.float32), int(v_sr), subtype="PCM_16")
 
 
 # ============================================================
@@ -2029,8 +2364,9 @@ class JobCancelled(BaseException):
 class BookJob:
     """Estado compartido entre el hilo generador y la interfaz (nunca llama a st.*)."""
 
-    def __init__(self, idea: str, genre: str, style: str):
+    def __init__(self, idea: str, genre: str, style: str, include_music: bool = True):
         self.idea, self.genre, self.style = idea, genre, style
+        self.include_music = include_music
         self.lock = threading.RLock()
         self.thread = None
         self.cancel = False
@@ -2048,6 +2384,8 @@ class BookJob:
         self.pdf_path = None
         self.zip_path = None
         self.pdf_note = ""
+        self.started_at = time.monotonic()
+        self.finished_at = None
 
     def set_frame(self, idx, scene, **kw):
         with self.lock:
@@ -2059,12 +2397,13 @@ class BookJob:
 
     def snapshot(self) -> dict:
         with self.lock:
+            elapsed = max(0.0, (self.finished_at or time.monotonic()) - self.started_at)
             return {
                 "status": self.status, "note": self.note, "cancel": self.cancel,
                 "steps": [dict(s) for s in self.steps], "scenes": list(self.scenes),
                 "drafts": dict(self.drafts), "thumbs": dict(self.thumbs),
                 "voices": dict(self.voices), "frame": dict(self.frame),
-                "used_fallback": self.used_fallback,
+                "used_fallback": self.used_fallback, "elapsed": elapsed,
             }
 
 
@@ -2211,6 +2550,9 @@ def build_zip(story: dict, out_path: Path, pdf_path=None) -> None:
         for i, sc in enumerate(story["scenes"], 1):
             z.write(sc["image"], f"{base}/escena_{i}.png", compress_type=zipfile.ZIP_STORED)
             z.write(sc["voice"], f"{base}/voz_{i}.wav")
+        music_file = story.get("music")
+        if music_file and Path(music_file).exists():
+            z.write(music_file, f"{base}/musica_fondo.wav")
         if pdf_path and Path(pdf_path).exists():
             z.write(pdf_path, f"{base}/{base}.pdf", compress_type=zipfile.ZIP_STORED)
 
@@ -2271,9 +2613,41 @@ def run_book_job(job: BookJob) -> None:
                 job.steps[k]["t"] = True
                 job.scenes[k] = {"title": sc["title"], "text": sc["text"]}
 
-        # --- Fase 2: ilustraciones (boceto -> pintado) ---
+        # --- Fase 2 y 3 en paralelo: ilustraciones (GPU) + voz (CPU) ---
+        # Precarga los pipelines de imagen antes de lanzar el hilo de voz:
+        # diffusers.from_pretrained(..., torch_dtype=float16) cambia temporalmente
+        # torch.set_default_dtype(float16) de forma global, lo que romperia Kokoro en CPU.
+        load_image_pipe()
+        load_img2img_pipe()
+        torch.set_default_dtype(torch.float32)
+
+        voice_state = {"paths": None, "error": None, "done": False}
+        images_done = threading.Event()
+
+        def on_voice_done(i, path):
+            check()
+            with job.lock:
+                job.voices[i - 1] = path
+                job.steps[i - 1]["v"] = True
+            if images_done.is_set():
+                nxt = min(i, N_SCENES - 1)
+                job.set_frame(nxt, scenes[nxt], image_uri=job.thumbs.get(nxt), img_mode="done",
+                              text_mode="done", turn=(i < N_SCENES))
+                job.set_note(f"Escena {i}: voz lista." if i == N_SCENES else f"Narrando la escena {i + 1}...")
+
+        def _voice_worker():
+            try:
+                voice_state["paths"] = generate_narrations(story, on_voice_done, genre=job.genre)
+            except BaseException as exc:
+                voice_state["error"] = exc
+            finally:
+                voice_state["done"] = True
+
+        voice_thread = threading.Thread(target=_voice_worker, daemon=True, name="eter-voice-cpu")
+        voice_thread.start()
+
         job.set_frame(0, scenes[0], text_mode="done", turn=True)
-        job.set_note("Ilustrando la escena 1...")
+        job.set_note("Ilustrando (GPU) y narrando (CPU) en paralelo...")
 
         def on_img_preview(i, pil_img):
             check()
@@ -2306,25 +2680,33 @@ def run_book_job(job: BookJob) -> None:
 
         images = generate_scene_images(story, job.genre, job.style, on_img_done,
                                        preview_cb=on_img_preview, step_cb=on_img_step)
+        images_done.set()
         check()
 
-        # --- Fase 3: voz (el libro pasa de pagina escena por escena) ---
-        job.set_frame(0, scenes[0], image_uri=job.thumbs.get(0), img_mode="done",
-                      text_mode="done", turn=True)
-        job.set_note("Narrando la escena 1...")
-
-        def on_voice_done(i, path):
-            check()
-            with job.lock:
-                job.voices[i - 1] = path
-                job.steps[i - 1]["v"] = True
-            nxt = min(i, N_SCENES - 1)
-            job.set_frame(nxt, scenes[nxt], image_uri=job.thumbs.get(nxt), img_mode="done",
-                          text_mode="done", turn=(i < N_SCENES))
-            job.set_note(f"Escena {i}: voz lista." if i == N_SCENES else f"Narrando la escena {i + 1}...")
-
-        voices = generate_narrations(story, on_voice_done, genre=job.genre)
+        if not voice_state["done"]:
+            job.set_note("Finalizando narración de voz...")
+        voice_thread.join()
         check()
+        if voice_state["error"] is not None:
+            raise voice_state["error"]
+        voices = voice_state["paths"]
+
+        # --- Fase 4: música de fondo (MusicGen en GPU) + mezcla con la voz ---
+        if job.include_music:
+            try:
+                job.set_note("Componiendo música de fondo (IA)...")
+                music_path = generate_background_music(story, job.genre)
+                check()
+                job.set_note("Mezclando música suave detrás de la narración...")
+                mix_narration_with_music(voices, music_path)
+                story["music"] = str(music_path)
+            except JobCancelled:
+                raise
+            except Exception:
+                try:
+                    (OUT_DIR / "debug_music.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                except Exception:
+                    pass
 
         # --- Cierre: historia.json + archivos descargables ---
         for i, sc in enumerate(story["scenes"]):
@@ -2336,10 +2718,13 @@ def run_book_job(job: BookJob) -> None:
         build_downloads(job, story)
         job.story = story
         job.set_note("¡Libro encuadernado!")
+        job.finished_at = time.monotonic()
         job.status = "done"
     except JobCancelled:
+        job.finished_at = time.monotonic()
         job.status = "cancelled"
     except Exception:
+        job.finished_at = time.monotonic()
         job.error = traceback.format_exc()
         job.status = "error"
 
@@ -2457,14 +2842,16 @@ def _generation_ui(polling: bool):
 
     total = N_SCENES * 3
     done = sum(int(s[k]) for s in snap["steps"] for k in ("t", "i", "v"))
+    mins, secs = divmod(int(snap.get("elapsed", 0)), 60)
+    timer_txt = f"{mins:02d}:{secs:02d}"
     if status == "running" and snap["cancel"]:
-        label = "Cancelando... terminando el paso en curso"
+        label = f"Cancelando... terminando el paso en curso · ⏱️ {timer_txt}"
     elif status == "done":
-        label = "¡Libro terminado!"
+        label = f"¡Libro terminado! · ⏱️ Tiempo total: {timer_txt}"
     else:
-        label = f"Creando tu obra literaria... {done}/{total} pasos"
+        label = f"Creando tu obra literaria... {done}/{total} pasos · ⏱️ {timer_txt}"
     st.progress(done / total, text=label)
-    st.markdown(f'<div class="audio-label">{html.escape(snap["note"])}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="audio-label">{html.escape(snap["note"])} · ⏱️ {timer_txt}</div>', unsafe_allow_html=True)
     if snap["used_fallback"]:
         st.warning("Se usó un relato base alternativo por contingencia.")
 
@@ -2627,6 +3014,12 @@ elif st.session_state.screen == "studio":
             options=list(STYLE_EN.keys())
         )
 
+        include_music = st.toggle(
+            "🎵 Incluir música de fondo (IA)",
+            value=True,
+            help="Compone una pista instrumental acorde al género y la mezcla suavemente detrás de la narración."
+        )
+
     st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
     _, btn_col, _ = st.columns([1, 2, 1])
 
@@ -2651,7 +3044,7 @@ elif st.session_state.screen == "studio":
                 shutil.rmtree(OUT_DIR)
             OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-            job = BookJob(idea.strip(), genre, style)
+            job = BookJob(idea.strip(), genre, style, include_music=include_music)
             job.thread = threading.Thread(target=run_book_job, args=(job,), daemon=True, name="eter-book-job")
             _registry()["job"] = job
             st.session_state.job = job

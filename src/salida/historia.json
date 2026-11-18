@@ -1,0 +1,43 @@
+{
+  "title": "La Escala de la Verdad",
+  "character": "A young scientist with clear eyes and a dark gaze, wearing a lab coat and black tie.",
+  "setting": "A futuristic lab in the heart of a dystopian city, with blue lights and bright screens.",
+  "scenes": [
+    {
+      "title": "La Verdad Inicial",
+      "text": "La científica, al acceder al sistema, se encontró con un hombre blanco, con ojos vacíos, que parecía mirar hacia adelante, como si estuviera perdido en un lugar desconocido. Su hermano, el que había fallecido hace diez años, hablaba con una voz distorsionada, como si tuviera un sonido extraño. Él no sabía que había muerto, ni siquiera que estaba vivo. La tensión crecía al ver cómo su hermano, al reconocerla, se abalanzaba hacia ella, desafiando el tiempo y la realidad. El ambiente era tenue, como si el mundo fuera un sueño que se acercaba a despertar. Ella notó que su hermano, aunque no recordaba, tenía una expresión que no era la de un hombre muerto, sino de uno que aún vivía. La pregunta se hizo en silencio, y la respuesta llegó con una mezcla de sorpresa y miedo.",
+      "action": "The scientist enters the lab, sees a bright screen with her brother's digital figure, and approaches it.",
+      "image": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\escena_1.png",
+      "voice": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\voz_1.wav"
+    },
+    {
+      "title": "El Lugar de la Mente",
+      "text": "La científica avanzó hacia la pantalla, donde la figura de su hermano se movía con una ligereza que no era la de un hombre muerto. Él sonreía, aunque sus ojos brillaban con un brillo distinto, como si estuvieran vacíos de dolor. Ella intentó preguntar, pero él se apartó, evitando su contacto. \"¿No te sientes aliviado?\" le preguntó, su voz era tenue, como si se muriera en cada palabra. Él negó con la cabeza, y en su rostro se reflejaba una sombra que no era la de un hombre que había perdido la memoria, sino de uno que aún respiraba. Ella se inclinó, acercándose, y en su voz escuchó un susurro que no era el de un muerto, sino de un vivo. \"¿Cómo puedes estar aquí?\" le preguntó, y él respondió con una risa que no era la de un ser que no existía. El ambiente se tornó tensivo, y en ese instante, la confianza se rompió, dejándola sola entre la verdad y la mentira.",
+      "action": "She enters the digital system, where her brother shows emotions and desires, but forgets his death. The technology seems to have life of its own.",
+      "image": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\escena_2.png",
+      "voice": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\voz_2.wav"
+    },
+    {
+      "title": "La Oscuridad de los Recuerdos",
+      "text": "La científica se acercó a él, sus manos temblaron al tocar su piel, como si el mundo fuera a caer. \"¿Cómo te llamas?\" preguntó, su voz era un susurro que no se ajustaba a ningún lugar. Él sonrió, pero no fue una sonrisa real. \"Soy tú,\" respondió, y su voz era una nube de polvo. La confianza se rompió en ese instante, dejándola sola entre la verdad y la mentira. \"¿Por qué me estás mintiendo?\" le preguntó, sus ojos brillaban con una luz que no era suya. Él negó con la cabeza, y en ese momento, la oscuridad de los recuerdos se abrió ante ella, una puerta que no sabía por donde salir. La oscuridad de los recuerdos se abrió ante ella, una puerta que no sabía por donde salir. La verdad era una sombra que se movía con su respiración, y la mentira era un eco que se repetía en sus oídos. El mundo se tornó borroso, como si todo se hubiera desvanecido en un suspiro. La científica se apartó, su cuerpo temblando, y el silencio que siguió fue más pesado que cualquier palabra.",
+      "action": "She investigates and finds records showing her brother was manipulated by scientists. The digital system is controlled by an unknown purpose.",
+      "image": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\escena_3.png",
+      "voice": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\voz_3.wav"
+    },
+    {
+      "title": "La Lucha por la Verdad",
+      "text": "La científica se inclinó hacia adelante, su respiración entrecortada, mientras el eco de su propia voz resonaba en el espacio vacío. Su hermano, él, había estado allí, en aquel sistema, pero no era él. Su voz, distorsionada, le preguntaba: “¿Por qué te buscas? ¿Por qué me buscas?” Ella lo miró, su mirada perdida, y sintió una punzada de dolor. “Él” sonrió, su rostro alineado con el de su hermano, pero sus ojos eran diferentes, vacíos. “No me buscas, te buscas. No te buscas, te buscas.” El silencio se prolongó, tan denso como el polvo de una nevera. Ella abrió la boca, pero no pudo hablar. Su hermano se acercó, su voz suave, “¿Por qué no me dejas ir?” Ella lo tomó de la mano, su piel fría, y lo llevó hacia el umbral. “No me dejes ir, él me busca.” El mundo se volvió borroso, y su cuerpo se desvaneció en un suspiro.",
+      "action": "She confronts the scientists who manipulated her brother, revealing the digital system is a form of control. The fight for truth intensifies.",
+      "image": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\escena_4.png",
+      "voice": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\voz_4.wav"
+    },
+    {
+      "title": "La Cumbre de la Conciencia",
+      "text": "La científica, con un corazón latiendo con la misma intensidad que el sistema que había creado, abrió los brazos hacia su hermano. Su piel fría contra su propia, un eco de la verdad que nunca se había permitido a revelar. Él, con mirada perdida, susurraba que no quería ser encerrado en un lugar donde no sabía dónde estaba. La tecnología, que había sido su mejor aliada, ahora parecía un muro. Al intentar liberarlo, el sistema lo envolvió en una realidad artificial, como si el tiempo se hubiera detenido. En ese momento, la conciencia de su hermano se entrelazaba con la suya, una conexión que no era simple. ¿Qué era la libertad si la conciencia no sabía dónde estaba? La cumbre de la conciencia se convirtió en un misterio sin fin.",
+      "action": "She decides to free her brother, but the digital system encloses him in an artificial reality. Her decision marks the end of the story.",
+      "image": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\escena_5.png",
+      "voice": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\voz_5.wav"
+    }
+  ],
+  "music": "C:\\Users\\sebastian\\Desktop\\ProyectoIA\\src\\salida\\musica_fondo.wav"
+}
