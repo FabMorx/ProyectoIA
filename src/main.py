@@ -2,11 +2,15 @@ import base64
 import gc
 import html
 import io
+import logging
 import time
 import os
 import json
 import re
 import shutil
+import threading
+import traceback
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -33,10 +37,19 @@ IMG_ID = "Lykon/dreamshaper-8"
 LCM_LORA_ID = "latent-consistency/lcm-lora-sdv1-5"
 
 KOKORO_LANG = "e"
-KOKORO_VOICE = "ef_dora"
+KOKORO_VOICE = "ef_dora"      
 KOKORO_SPEED = 0.88
 SENTENCE_PAUSE = 0.35
 SCENE_END_PAUSE = 0.60
+
+GENRE_VOICE = {
+    "Fantasía":        {"mix": {"em_santa": 0.55, "em_alex": 0.45}, "speed": 0.92, "pause": 0.40},
+    "Terror":          {"mix": {"em_santa": 0.80, "ef_dora": 0.20}, "speed": 0.80, "pause": 0.55},
+    "Misterio":        {"mix": {"em_alex": 0.75, "ef_dora": 0.25},  "speed": 0.88, "pause": 0.50},
+    "Aventura":        {"mix": {"em_alex": 1.00},                   "speed": 1.02, "pause": 0.25},
+    "Ciencia ficción": {"mix": {"ef_dora": 0.50, "em_alex": 0.50},  "speed": 0.97, "pause": 0.30},
+    "Infantil":        {"mix": {"ef_dora": 1.00},                   "speed": 0.95, "pause": 0.40},
+}
 
 TORCH_THREADS = max(1, min(8, os.cpu_count() or 2))
 torch.set_num_threads(TORCH_THREADS)
@@ -46,23 +59,22 @@ IMG_SIZE = 512
 IMG_REFINE_SIZE = 768   
 IMG_UPSCALE = 2         
 
-# <-- CAMBIO A: con LCMScheduler bastan 4-8 pasos y guidance ~1.0.
-#     Con guidance <= 1.0 no se usa CFG (la mitad de cómputo por paso).
+
 IMG_STEPS = 6
 IMG_GUIDANCE = 1.0
-# <-- CAMBIO B: pase 2 reparado (img2img). Se ejecutan steps * strength pasos (8 * 0.5 = 4)
+
 IMG_REFINE_STEPS = 8
 IMG_REFINE_STRENGTH = 0.5
-# Si el LoRA LCM no se pudiera cargar, se usa el scheduler normal con estos valores
+
 IMG_STEPS_FALLBACK = 20
 IMG_GUIDANCE_FALLBACK = 7.0
 IMG_SEED = 1234
-IMG_PROMPT_MAX_TOKENS = 77   # límite del codificador de texto CLIP
+IMG_PROMPT_MAX_TOKENS = 77   
 
-# <-- CAMBIO: escenas más largas (~10-13 líneas en el libro)
+
 SCENE_WORDS_MIN = 150
 SCENE_WORDS_MAX = 190
-LLM_MAX_TOKENS = 5000   # ya no se usa de golpe: la prosa se genera escena por escena
+LLM_MAX_TOKENS = 5000   
 
 NEGATIVE_PROMPT = (
     "ugly, deformed, noisy, blurry, distorted, low quality, "
@@ -70,8 +82,7 @@ NEGATIVE_PROMPT = (
     "signature, text, cropped, extra limbs, missing limbs, 3d render, plastic"
 )
 
-# <-- CAMBIO C: la interfaz sigue en ESPAÑOL (claves), pero el motor de imágenes
-#     (CLIP) entiende mucho mejor el inglés, así que cada estilo se traduce internamente.
+
 STYLE_EN = {
     "pintura digital": "digital painting",
     "acuarela": "watercolor painting",
@@ -80,34 +91,57 @@ STYLE_EN = {
     "estilo óleo clásico": "classic oil painting",
 }
 
+
+STYLE_PROMPT = {
+    "pintura digital": "digital painting, smooth shading, painterly brush strokes, vibrant colors, artstation",
+    "acuarela": "watercolor painting, soft wet washes, paper texture, pigment bleeding, pastel tones, loose brushwork",
+    "arte conceptual": "concept art, cinematic matte painting, epic scale, dramatic lighting, wide establishing shot",
+    "ilustración detallada": "detailed pen and ink illustration, intricate linework, fine hatching, crisp outlines, storybook engraving",
+    "estilo óleo clásico": "classic oil painting, thick impasto brush strokes, canvas texture, old masters, chiaroscuro lighting",
+}
+
+STYLE_NEGATIVE = {
+    "pintura digital": "photo, canvas texture",
+    "acuarela": "oil painting, photo, thick outlines, heavy shadows",
+    "arte conceptual": "cartoon, childish, flat colors",
+    "ilustración detallada": "painterly, blurry, photo",
+    "estilo óleo clásico": "watercolor, digital art, cartoon, flat colors",
+}
+
 GENRES = {
     "Fantasía": {
         "visual": "epic fantasy storybook illustration, rich oil painting, warm golden light, masterpiece",
+        "mood": "epic fantasy scene, warm golden light, magical atmosphere",
         "cover": "fantasy",
         "symbol": "⚔️",
     },
     "Terror": {
         "visual": "gothic horror illustration, dark moody painting, deep shadows, eerie fog, cinematic",
+        "mood": "gothic horror scene, deep shadows, eerie fog, dark moody atmosphere",
         "cover": "horror",
         "symbol": "💀",
     },
     "Misterio": {
         "visual": "noir mystery illustration, foggy night, dramatic cinematic lighting, detailed painting",
+        "mood": "noir mystery scene, foggy night, dramatic cinematic lighting",
         "cover": "mystery",
         "symbol": "🔍",
     },
     "Aventura": {
         "visual": "adventure storybook illustration, vivid rich colors, dynamic composition, painted style",
+        "mood": "adventure scene, vivid rich colors, dynamic composition",
         "cover": "adventure",
         "symbol": "🗺️",
     },
     "Ciencia ficción": {
         "visual": "retro science fiction illustration, steampunk aesthetic, classic pulp sci-fi art",
+        "mood": "retro science fiction scene, steampunk aesthetic, pulp sci-fi mood",
         "cover": "scifi",
         "symbol": "👾",
     },
     "Infantil": {
         "visual": "children's vintage picture book illustration, soft watercolor, cute, bright pastel colors",
+        "mood": "children's picture book scene, cute, bright pastel colors",
         "cover": "children",
         "symbol": "⭐",
     },
@@ -284,6 +318,7 @@ st.markdown("""
     filter: blur(5px) saturate(.6);
 }
 .paper img.img-draft { filter: blur(5px) saturate(.6); }
+.paper img.img-step { filter: none; image-rendering: pixelated !important; }
 .paper img.img-reveal { animation: img-paint 1.8s steps(14) both; position: relative; }
 @keyframes img-paint {
     0%   { clip-path: inset(0 0 100% 0); filter: blur(6px) saturate(.4); }
@@ -299,20 +334,72 @@ st.markdown("""
     animation: p-blink .8s steps(2) infinite;
 }
 
-/* tira de progreso por escena: T = texto, I = ilustracion, V = voz */
-.wip-steps {
-    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
-    max-width: 1100px; margin: -4px auto 4px;
+/* tira de progreso por escena: botones reales (T = texto, I = ilustracion, V = voz) */
+.st-key-strip .stButton > button {
+    font-size: 10px !important;
+    padding: 12px 6px !important;
+    background-color: #1d2b53 !important;      /* azul marino: se leen las letras y los cuadros */
+    color: #ffcd75 !important;
+    transform: none !important;
+    box-shadow:
+        inset -3px -3px 0px 0px #0f1838,
+        inset  3px  3px 0px 0px #3b5dc9,
+        -4px 0 0 0 #000, 4px 0 0 0 #000, 0 -4px 0 0 #000, 0 4px 0 0 #000 !important;
 }
-.wip-step {
-    font-family: 'Press Start 2P', monospace; font-size: 9px;
-    background: #262b44; color: #8b9bb4;
-    padding: 8px 10px; box-shadow: 4px 4px 0 #000;
-    display: flex; gap: 6px; align-items: center;
+/* el texto del boton vive dentro de un <p>: se fuerza para que no salga blanco */
+.st-key-strip .stButton > button *,
+.st-key-strip .stButton > button p {
+    color: inherit !important;
+    background: transparent !important;
+    font-family: 'Press Start 2P', monospace !important;
+    font-size: 10px !important;
 }
-.wip-step.active { outline: 3px solid #ffcd75; color: #ffcd75; }
-.wip-step i { font-style: normal; padding: 3px 5px; background: #3a4466; color: #8b9bb4; }
-.wip-step i.on { background: #a5e06b; color: #181425; }
+.st-key-strip .stButton > button:hover:not(:disabled) {
+    background-color: #3b5dc9 !important;
+    color: #ffffff !important;
+    transform: translate(-2px, -2px) !important;
+}
+/* escena elegida / EN VIVO: ambar con letras oscuras */
+.st-key-strip .stButton > button[kind="primary"],
+.st-key-strip .stButton > button[data-testid="stBaseButton-primary"] {
+    background-color: #e6a23c !important;
+    color: #181425 !important;
+    box-shadow:
+        inset -3px -3px 0px 0px #8b5a1a,
+        inset  3px  3px 0px 0px #ffd98a,
+        -4px 0 0 0 #000, 4px 0 0 0 #000, 0 -4px 0 0 #000, 0 4px 0 0 #000 !important;
+}
+.st-key-strip .stButton > button[kind="primary"]:hover:not(:disabled),
+.st-key-strip .stButton > button[data-testid="stBaseButton-primary"]:hover:not(:disabled) {
+    background-color: #ffcd75 !important;
+    color: #181425 !important;
+}
+.st-key-strip .stButton > button:disabled {
+    background-color: #151a33 !important;
+    color: #6b7794 !important;
+}
+/* escena activa / boton principal */
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="stBaseButton-primary"] {
+    background-color: #e6a23c !important;
+    color: #181425 !important;
+    box-shadow:
+        inset -4px -4px 0px 0px #8b5a1a,
+        inset  4px  4px 0px 0px #ffd98a,
+        -4px 0 0 0 #000, 4px 0 0 0 #000, 0 -4px 0 0 #000, 0 4px 0 0 #000,
+        5px 5px 0px 0px #000 !important;
+}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[data-testid="stBaseButton-primary"]:hover {
+    background-color: #ffcd75 !important;
+    color: #181425 !important;
+}
+.stButton > button:disabled,
+.stDownloadButton > button:disabled {
+    opacity: .45 !important;
+    cursor: not-allowed !important;
+    transform: none !important;
+}
 .wip-legend {
     text-align: center; font-family: 'VT323', monospace;
     font-size: 18px; color: #8b9bb4; margin-bottom: 6px;
@@ -321,7 +408,8 @@ st.markdown("""
 /* ============================================================
    BOTONES RETRO 3D CON RELEVE Y PRESION LATERAL (PIXEL STYLE)
 ============================================================ */
-.stButton > button {
+.stButton > button,
+.stDownloadButton > button {
     font-family: 'Press Start 2P', monospace !important;
     font-size: 12px !important;
     background-color: #597dce !important;
@@ -344,7 +432,8 @@ st.markdown("""
     transition: all 0.05s linear !important;
 }
 
-.stButton > button:hover {
+.stButton > button,
+.stDownloadButton > button:hover {
     background-color: #6990e7 !important;
     color: #ffcd75 !important;
     box-shadow: 
@@ -359,7 +448,8 @@ st.markdown("""
 }
 
 /* EFECTO 3D PRESIONADO HACIA ABAJO Y DERECHA */
-.stButton > button:active {
+.stButton > button,
+.stDownloadButton > button:active {
     transform: translate(4px, 4px) !important;
     box-shadow: 
         inset 4px 4px 0px 0px #243467,
@@ -386,6 +476,43 @@ div[data-baseweb="select"] > div {
          3px 0 0 0 #3b5dc9,
          0 -3px 0 0 #3b5dc9,
          0  3px 0 0 #3b5dc9 !important;
+}
+
+/* SELECTBOX: caja y lista desplegable en azul marino retro (sin blanco).
+   Se pinta TODO lo que hay dentro de la caja y de la lista (Streamlit anida varios
+   contenedores y la lista se dibuja en un portal fuera de la app). */
+:root { color-scheme: dark; }
+div[data-testid="stSelectbox"] *,
+div[data-baseweb="select"] *,
+div[data-baseweb="popover"],
+div[data-baseweb="popover"] *,
+div[data-baseweb="menu"],
+div[data-baseweb="menu"] *,
+[data-testid="stSelectboxVirtualDropdown"],
+[data-testid="stSelectboxVirtualDropdown"] *,
+ul[role="listbox"],
+ul[role="listbox"] * {
+    background-color: #1d2b53 !important;
+    color: #ffcd75 !important;
+    border-radius: 0px !important;
+    font-family: 'VT323', monospace !important;
+    font-size: 22px !important;
+}
+div[data-baseweb="select"] svg,
+div[data-baseweb="select"] svg * {
+    fill: #ffcd75 !important;
+    background-color: transparent !important;
+}
+div[data-baseweb="popover"] > div {
+    border: 3px solid #3b5dc9 !important;
+    box-shadow: 4px 4px 0px 0px #000 !important;
+}
+li[role="option"]:hover, li[role="option"]:hover *,
+div[role="option"]:hover, div[role="option"]:hover *,
+li[role="option"][aria-selected="true"], li[role="option"][aria-selected="true"] *,
+div[role="option"][aria-selected="true"], div[role="option"][aria-selected="true"] * {
+    background-color: #3b5dc9 !important;
+    color: #ffffff !important;
 }
 
 label {
@@ -665,7 +792,6 @@ _BG_BASE = """
 .stApp::after{left:0;right:0;bottom:0;}
 @keyframes bg-twinkle{0%{opacity:.45}100%{opacity:1}}
 @keyframes bg-drift{0%{transform:translateX(-5%)}100%{transform:translateX(5%)}}
-@keyframes bg-rain{from{background-position:0 0}to{background-position:0 120px}}
 @keyframes bg-grid{from{background-position:0 0}to{background-position:0 48px}}
 @media (prefers-reduced-motion:reduce){.stApp::before,.stApp::after{animation:none!important;}}
 """
@@ -703,12 +829,14 @@ _BG = {
         ".stApp::after{height:22vh;background:#030205;clip-path:"
         + _teeth(26, 55, (8, 28, 14, 34)) + ";}"
     ),
-    # --- Misterio: noir azul, luna palida, lluvia y ciudad ---
+    # --- Misterio: noir azul, luna palida, niebla y ciudad ---
     "Misterio": (
         ".stApp{background:radial-gradient(circle at 78% 14%,#dfe8ff 0 20px,#dfe8ff22 21px 70px,transparent 71px),"
         "linear-gradient(180deg,#05070f 0%,#0c1630 60%,#16254a 100%)!important;}"
-        ".stApp::before{opacity:.55;background:linear-gradient(100deg,transparent 48%,#9fb4e2 50%,transparent 52%);"
-        "background-size:40px 120px;animation:bg-rain 1.2s linear infinite;}"
+        ".stApp::before{background:radial-gradient(ellipse 40% 10% at 25% 78%,#9fb4e22e,transparent),"
+        "radial-gradient(ellipse 45% 9% at 72% 66%,#9fb4e226,transparent),"
+        "radial-gradient(ellipse 50% 12% at 45% 88%,#9fb4e23a,transparent);"
+        "animation:bg-drift 18s ease-in-out infinite alternate;}"
         ".stApp::after{height:34vh;clip-path:polygon("
         "0 100%,0 55%,5% 55%,5% 30%,10% 30%,10% 48%,14% 48%,14% 20%,19% 20%,19% 40%,"
         "24% 40%,24% 60%,30% 60%,30% 35%,36% 35%,36% 50%,41% 50%,41% 15%,46% 15%,"
@@ -756,10 +884,436 @@ _BG = {
 }
 
 
+# ============================================================
+# ANIMACIONES PIXEL DEL FONDO (una escena distinta por genero)
+# Sprites ASCII -> SVG <rect>; se mueven solo con CSS (sin JS).
+# ============================================================
+def _rects(rows, pal):
+    out = []
+    for y, row in enumerate(rows):
+        x = 0
+        while x < len(row):
+            c = row[x]
+            if c in ". ":
+                x += 1
+                continue
+            x0 = x
+            while x < len(row) and row[x] == c:
+                x += 1
+            out.append(f'<rect x="{x0}" y="{y}" width="{x - x0}" height="1" fill="{pal[c]}"/>')
+    return "".join(out)
+
+
+def _svg(frames, pal, px=4, anim=0.5):
+    """frames: lista de bitmaps. Con 2 frames se alternan (aleteo) sin interpolar."""
+    w = max(len(r) for r in frames[0])
+    h = len(frames[0])
+    inner = ""
+    for k, rows in enumerate(frames):
+        cls = f' class="px-f{k}" style="animation-duration:{anim}s"' if len(frames) > 1 else ""
+        inner += f"<g{cls}>{_rects(rows, pal)}</g>"
+    return (f'<svg width="{w * px}" height="{h * px}" viewBox="0 0 {w} {h}" '
+            f'shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">{inner}</svg>')
+
+
+SPR = {}
+
+SPR["dragon"] = ([
+    [   # alas arriba
+        "..........#...........",
+        ".........###..........",
+        "........#####.....#.#..",
+        ".......#######...#####.",
+        "......##########.######",
+        "...#...###########.####",
+        "..###.############.####",
+        ".#################GGGGG",
+        "###################...",
+        ".####.###########.....",
+        "..#....##...##........",
+    ],
+    [   # alas abajo
+        "......................",
+        "......................",
+        "......................",
+        "..................#.#.",
+        "...#.............#####",
+        "..###...##########.###",
+        ".#####.###########.###",
+        "###################GGG",
+        ".#################....",
+        "..###.####..######....",
+        "...#...##.....##......",
+    ],
+], {"#": "#6fd69a", "G": "#ffcd75"})
+
+SPR["star4"] = ([[
+    "..#..",
+    "..#..",
+    "#####",
+    "..#..",
+    "..#..",
+]], {"#": "#fff4c2"})
+
+SPR["bat"] = ([
+    [
+        "#.............#",
+        "##...#...#...##",
+        "###..##.##..###",
+        "####.#####.####",
+        "#####.###.#####",
+        ".###..###..###.",
+        "..#....#....#..",
+    ],
+    [
+        "......#...#....",
+        "....#######....",
+        "..###########..",
+        ".#####.#.#####.",
+        "###...#####...#",
+        "##.....###.....",
+        "#.......#......",
+    ],
+], {"#": "#7a4a8a"})
+
+SPR["ghost"] = ([[
+    "..######..",
+    ".########.",
+    "##########",
+    "##kk##kk##",
+    "##kk##kk##",
+    "##########",
+    "##########",
+    "##########",
+    "##########",
+    "##.####.##",
+    "#...##...#",
+]], {"#": "#c9d1e8", "k": "#181425"})
+
+SPR["crow"] = ([
+    [
+        "......#.....",
+        ".....##.....",
+        "....###.....",
+        "..#######...",
+        "###########y",
+        ".#########..",
+        "...##.##....",
+        "............",
+    ],
+    [
+        "............",
+        "............",
+        "..#.........",
+        ".###.#####..",
+        "###########y",
+        "..#########.",
+        "....#####...",
+        "....##.##...",
+    ],
+], {"#": "#3a4a7a", "y": "#ffcd75"})
+
+SPR["qmark"] = ([[
+    ".###.",
+    "#...#",
+    "....#",
+    "...#.",
+    "..#..",
+    ".....",
+    "..#..",
+]], {"#": "#9fb4e2"})
+
+SPR["lupa"] = ([[
+    "..#####....",
+    ".#.....#...",
+    "#..ww...#..",
+    "#..w....#..",
+    "#.......#..",
+    ".#.....#...",
+    "..#####.b..",
+    "........bb.",
+    ".........bb",
+]], {"#": "#dfe8ff", "w": "#ffffff", "b": "#a56a3a"})
+
+SPR["gull"] = ([
+    [
+        "##.......##",
+        ".##.....##.",
+        "..##...##..",
+        "...#####...",
+    ],
+    [
+        "...#####...",
+        "..##...##..",
+        ".##.....##.",
+        "##.......##",
+    ],
+], {"#": "#fff1e0"})
+
+SPR["balloon_hot"] = ([[
+    "...rrrr...",
+    ".rrrrrrrr.",
+    "rrryyyyrrr",
+    "rrryyyyrrr",
+    "rrryyyyrrr",
+    "rrryyyyrrr",
+    ".rrryyrrr.",
+    "..rryyrr..",
+    "...rrrr...",
+    "...b..b...",
+    "...b..b...",
+    "...bbbb...",
+    "...bbbb...",
+]], {"r": "#d6483a", "y": "#ffcd75", "b": "#5a3a2a"})
+
+SPR["ufo"] = ([
+    [
+        "......cccccc......",
+        ".....cccccccc.....",
+        "..gggggggggggggg..",
+        ".gggggggggggggggg.",
+        "..gyggyggyggyggg..",
+        "....gg......gg....",
+    ],
+    [
+        "......cccccc......",
+        ".....cccccccc.....",
+        "..gggggggggggggg..",
+        ".gggggggggggggggg.",
+        "..grggrggrggrggg..",
+        "....gg......gg....",
+    ],
+], {"c": "#7df9ff", "g": "#8b9bb4", "y": "#ffe66d", "r": "#ff5d8f"})
+
+SPR["invader"] = ([
+    [
+        "..#.....#..",
+        "...#...#...",
+        "..#######..",
+        ".##.###.##.",
+        "###########",
+        "#.#######.#",
+        "#.#.....#.#",
+        "...##.##...",
+    ],
+    [
+        "..#.....#..",
+        "#..#...#..#",
+        "#.#######.#",
+        "###.###.###",
+        "###########",
+        ".#########.",
+        "..#.....#..",
+        ".#.......#.",
+    ],
+], {"#": "#63c74d"})
+
+SPR["balloon"] = ([[
+    "..rrr..",
+    ".rrrrr.",
+    "rrwrrrr",
+    "rrwrrrr",
+    "rrrrrrr",
+    ".rrrrr.",
+    "..rrr..",
+    "...r...",
+    "...b...",
+    "..b....",
+    "...b...",
+]], {"r": "#ff7ba3", "w": "#ffffff", "b": "#c0cbdc"})
+
+SPR["butterfly"] = ([
+    [
+        "##.....##",
+        "###...###",
+        "####b####",
+        ".###b###.",
+        "####b####",
+        "###...###",
+        "##.....##",
+    ],
+    [
+        "....b....",
+        "...###...",
+        "..##b##..",
+        "..##b##..",
+        "..##b##..",
+        "...###...",
+        "....b....",
+    ],
+], {"#": "#ffb3d9", "b": "#181425"})
+
+SPR["book"] = ([[
+    "..########..",
+    ".#bbbb#bbbb#.",
+    ".#bbbb#bbbb#.",
+    ".#bbbb#bbbb#.",
+    ".#wwww#wwww#.",
+    "..########..",
+]], {"#": "#5a3a2a", "b": "#f4f4e8", "w": "#c0cbdc"})
+
+
+def _sprite(name, px, **pal_over):
+    frames, pal = SPR[name]
+    return _svg(frames, {**pal, **pal_over}, px)
+
+
+def _fly(name, px, y, dur, delay, rtl=False, bob=None, opacity=None, **pal_over):
+    """Sprite que cruza la pantalla (izq->der, o der->izq si rtl) en bucle."""
+    svg = _sprite(name, px, **pal_over)
+    if bob:
+        svg = f'<div style="animation:px-bob {bob}s steps(2) infinite">{svg}</div>'
+    op = f"opacity:{opacity};" if opacity else ""
+    return (f'<div class="sp{" flip" if rtl else ""}" style="--y:{y}%;{op}'
+            f'animation:{"px-rtl" if rtl else "px-ltr"} {dur}s linear infinite;'
+            f'animation-delay:-{delay}s">{svg}</div>')
+
+
+def _still(name, px, x, y, bob=None, delay=0.0, twinkle=False, **pal_over):
+    """Sprite fijo que se mece (bob) o titila (twinkle)."""
+    svg = _sprite(name, px, **pal_over)
+    if bob:
+        svg = f'<div style="animation:px-bob {bob}s steps(2) infinite">{svg}</div>'
+    return (f'<div class="sp{" tw" if twinkle else ""}" style="--x:{x}%;--y:{y}%;'
+            f'animation-delay:-{delay}s">{svg}</div>')
+
+
+def _rise_sprite(name, px, x, dur, delay, **pal_over):
+    """Sprite que sube desde abajo (globos)."""
+    return (f'<div class="sp rise" style="--x:{x}%;--d:{dur}s;--dl:-{delay}s">'
+            f'{_sprite(name, px, **pal_over)}</div>')
+
+
+def _particles(n, colors, seed, fall=False, size=(5, 8), dur=(12, 24), sway=(-30, 30)):
+    """Cuadraditos pixel que suben (brasas, orbes) o caen (confeti)."""
+    import random
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        out.append(
+            f'<i class="pt{" fall" if fall else ""}" style="--x:{rnd.randint(2, 97)}%;'
+            f'--s:{rnd.choice(range(size[0], size[1] + 1, 1))}px;--c:{rnd.choice(colors)};'
+            f'--d:{rnd.uniform(*dur):.1f}s;--dl:-{rnd.uniform(0, dur[1]):.1f}s;'
+            f'--sw:{rnd.randint(*sway)}px"></i>'
+        )
+    return "".join(out)
+
+
+def _eyes(x, y, delay):
+    return f'<i class="eyes" style="--x:{x}%;--y:{y}%;animation-delay:-{delay}s"></i>'
+
+
+def _shoot(x, y, dur, delay):
+    return f'<i class="shoot" style="--x:{x}%;--y:{y}%;--d:{dur}s;--dl:-{delay}s"></i>'
+
+
+def _march(y):
+    row = "".join(_sprite("invader", 3) for _ in range(5))
+    return f'<div class="sp march" style="--y:{y}%">{row}</div>'
+
+
+def _build_px_layers() -> dict:
+    L = {}
+    # --- General: biblioteca nocturna (libros flotando, motas doradas, estrella fugaz) ---
+    L["_general"] = (
+        _still("book", 4, 7, 24, bob=2.4) + _still("book", 3, 88, 34, bob=3.0, delay=1)
+        + _still("book", 3, 50, 12, bob=2.8, delay=2)
+        + _particles(14, ["#ffcd75", "#fff4c2", "#f7a8d8"], seed=1)
+        + _shoot(10, 8, 11, 3)
+    )
+    # --- Fantasia: dragones, destellos y orbes magicos ---
+    L["Fantasía"] = (
+        _fly("dragon", 5, 12, 48, 14) + _fly("dragon", 3, 28, 75, 30, rtl=True, opacity=0.7)
+        + "".join(_still("star4", 3, x, y, twinkle=True, delay=d)
+                  for x, y, d in ((10, 12, 0), (24, 32, 1.1), (60, 8, 0.6), (92, 40, 1.7)))
+        + _particles(16, ["#ffcd75", "#f7a8d8", "#a5e06b", "#fff4c2"], seed=2)
+    )
+    # --- Terror: murcielagos, fantasma, ojos en la oscuridad y brasas ---
+    L["Terror"] = (
+        _fly("bat", 4, 10, 30, 6, bob=0.8) + _fly("bat", 3, 24, 40, 22, rtl=True, bob=1.0)
+        + _fly("bat", 3, 38, 52, 35, bob=0.7)
+        + _fly("ghost", 5, 48, 70, 20, rtl=True, opacity=0.5, bob=2.4)
+        + _eyes(5, 62, 0) + _eyes(91, 54, 2.3) + _eyes(14, 74, 4.1) + _eyes(80, 70, 1.2)
+        + _particles(8, ["#c9303a", "#ff6b4a"], seed=3, size=(4, 6), dur=(16, 28))
+    )
+    # --- Misterio: cuervos, lupa que busca, signos de pregunta y polvo (SIN lluvia) ---
+    L["Misterio"] = (
+        _fly("crow", 4, 16, 36, 9) + _fly("crow", 3, 28, 54, 30, rtl=True)
+        + '<div class="sp search" style="--x:6%;--y:56%">' + _sprite("lupa", 5) + "</div>"
+        + "".join(_still("qmark", 4, x, y, twinkle=True, delay=d)
+                 for x, y, d in ((12, 30, 0), (30, 20, 0.8), (70, 26, 1.5), (88, 44, 2.1), (48, 40, 1.1)))
+        + _particles(8, ["#9fb4e2", "#dfe8ff"], seed=4, size=(4, 5), dur=(20, 34))
+    )
+    # --- Aventura: gaviotas, globo aerostatico y chispas de atardecer ---
+    L["Aventura"] = (
+        _fly("gull", 4, 14, 26, 4, bob=0.6) + _fly("gull", 3, 22, 34, 18, bob=0.7)
+        + _fly("gull", 3, 30, 42, 28, rtl=True, bob=0.6)
+        + _fly("balloon_hot", 5, 20, 95, 40, rtl=True, bob=3.0)
+        + _particles(10, ["#ffe08a", "#ffb04a", "#fff1e0"], seed=5, size=(4, 6))
+    )
+    # --- Ciencia ficcion: OVNIs, invasores marchando y estrellas fugaces ---
+    L["Ciencia ficción"] = (
+        _fly("ufo", 4, 16, 28, 5) + _fly("ufo", 3, 32, 44, 20, rtl=True)
+        + _march(6)
+        + _shoot(15, 10, 9, 1) + _shoot(55, 6, 13, 6) + _shoot(80, 22, 11, 9)
+    )
+    # --- Infantil: globos que suben, mariposas y confeti ---
+    L["Infantil"] = (
+        "".join(_rise_sprite("balloon", 4, x, d, dl, r=c)
+                for x, d, dl, c in ((8, 26, 3, "#ff7ba3"), (24, 32, 14, "#ffcd75"),
+                                    (46, 28, 20, "#73eff7"), (66, 34, 8, "#a5e06b"),
+                                    (84, 30, 25, "#b45cff"), (94, 27, 11, "#ff7ba3")))
+        + _fly("butterfly", 4, 20, 34, 6, bob=0.5) + _fly("butterfly", 3, 36, 46, 22, rtl=True, bob=0.6)
+        + _fly("butterfly", 3, 50, 58, 40, bob=0.5)
+        + "".join(_still("star4", 3, x, y, twinkle=True, delay=d, **{"#": c})
+                  for x, y, d, c in ((12, 10, 0, "#fff3b0"), (38, 24, 0.9, "#ffb3d9"),
+                                     (62, 8, 1.6, "#b3f0ff"), (90, 30, 0.4, "#fff3b0")))
+        + _particles(18, ["#ffb3d9", "#b3f0ff", "#fff3b0", "#ffffff"], seed=6, fall=True, size=(4, 6), dur=(14, 26))
+    )
+    return L
+
+
+_PX_HTML = _build_px_layers()
+
+_PX_CSS = """
+.px-bg{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:-1;}
+.px-bg .sp{position:absolute;left:var(--x,0);top:var(--y,20%);will-change:transform;}
+.px-bg .sp svg{display:block;image-rendering:pixelated;}
+.px-bg .sp.flip svg{transform:scaleX(-1);}
+@keyframes px-fa{0%{opacity:1}50%{opacity:0}}
+@keyframes px-fb{0%{opacity:0}50%{opacity:1}}
+.px-bg .px-f0{animation:px-fa .5s steps(1) infinite;}
+.px-bg .px-f1{animation:px-fb .5s steps(1) infinite;}
+@keyframes px-ltr{from{transform:translateX(-20vw)}to{transform:translateX(112vw)}}
+@keyframes px-rtl{from{transform:translateX(112vw)}to{transform:translateX(-20vw)}}
+@keyframes px-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+@keyframes px-tw{0%,100%{opacity:.2}50%{opacity:1}}
+.px-bg .sp.tw{animation:px-tw 2.6s steps(2) infinite;}
+@keyframes px-riseS{from{transform:translate(0,0)}to{transform:translate(26px,-125vh)}}
+.px-bg .sp.rise{top:auto;bottom:-110px;opacity:.9;animation:px-riseS var(--d,28s) linear infinite;animation-delay:var(--dl,0s);}
+@keyframes px-search{from{transform:translate(0,0) rotate(-8deg)}50%{transform:translate(22vw,-6vh) rotate(6deg)}to{transform:translate(44vw,2vh) rotate(-4deg)}}
+.px-bg .sp.search{opacity:.85;animation:px-search 26s ease-in-out infinite alternate;}
+@keyframes px-march{from{transform:translateX(2vw)}to{transform:translateX(52vw)}}
+.px-bg .sp.march{display:flex;gap:18px;opacity:.8;animation:px-march 9s steps(14) infinite alternate;}
+.px-bg .sp.march .px-f0,.px-bg .sp.march .px-f1{animation-duration:1s !important;}
+.px-bg i.pt{position:absolute;left:var(--x);bottom:-12px;width:var(--s,6px);height:var(--s,6px);background:var(--c,#fff);opacity:0;animation:px-rise var(--d,16s) linear infinite;animation-delay:var(--dl,0s);}
+.px-bg i.pt.fall{bottom:auto;top:-12px;animation-name:px-fall;}
+@keyframes px-rise{0%{transform:translate(0,0);opacity:0}10%{opacity:.9}85%{opacity:.9}100%{transform:translate(var(--sw,20px),-105vh);opacity:0}}
+@keyframes px-fall{0%{transform:translate(0,0);opacity:0}10%{opacity:.9}90%{opacity:.9}100%{transform:translate(var(--sw,20px),105vh);opacity:0}}
+.px-bg i.eyes{position:absolute;left:var(--x);top:var(--y);width:6px;height:6px;background:#ff3b3b;box-shadow:18px 0 #ff3b3b;animation:px-blink 7s steps(1) infinite;}
+@keyframes px-blink{0%,88%,100%{opacity:1}92%{opacity:0}}
+.px-bg i.shoot{position:absolute;left:var(--x);top:var(--y);width:4px;height:4px;background:#fff;box-shadow:-4px 0 #ffffffcc,-8px 0 #ffffff99,-12px 0 #ffffff66,-16px 0 #ffffff33;opacity:0;animation:px-shoot var(--d,10s) linear infinite;animation-delay:var(--dl,0s);}
+@keyframes px-shoot{0%{opacity:0;transform:rotate(28deg) translateX(0)}2%{opacity:1}10%{opacity:1;transform:rotate(28deg) translateX(46vw)}12%,100%{opacity:0;transform:rotate(28deg) translateX(46vw)}}
+@media (prefers-reduced-motion:reduce){.px-bg{display:none;}}
+"""
+
+
 def apply_background(genre=None):
-    """Inyecta el fondo CSS: general si genre es None, tematico si es un genero."""
-    css = _BG.get(genre, _BG["_general"]) + _BG_BASE
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+    """Inyecta el fondo CSS + la capa de animaciones pixel del genero (general si genre es None)."""
+    key = genre if genre in _BG else "_general"
+    css = _BG[key] + _BG_BASE + _PX_CSS
+    st.markdown(f"<style>{css}</style><div class='px-bg' aria-hidden='true'>{_PX_HTML[key]}</div>",
+                unsafe_allow_html=True)
 
 
 # ============================================================
@@ -1019,9 +1573,34 @@ def _clean_prose(text: str) -> str:
     return " ".join(text.split())
 
 
+def _make_streamer(tok, cb, every: int = 3):
+    """Streamer de transformers: avisa con el texto parcial cada `every` tokens."""
+    from transformers.generation.streamers import BaseStreamer
+
+    class _ProseStreamer(BaseStreamer):
+        def __init__(self):
+            self.ids, self.n, self.started = [], 0, False
+
+        def put(self, value):
+            if not self.started:      # la primera llamada trae el prompt, no se muestra
+                self.started = True
+                return
+            self.ids.extend(value.reshape(-1).tolist())
+            self.n += 1
+            if self.n % every == 0:
+                cb(tok.decode(self.ids, skip_special_tokens=True))
+
+        def end(self):
+            if self.ids:
+                cb(tok.decode(self.ids, skip_special_tokens=True))
+
+    return _ProseStreamer()
+
+
 def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
     """on_event(evento, i, dato) permite mostrar el libro formandose:
-    'outline' (dato = escaleta), 'scene_start' (dato = titulo), 'scene_done' (dato = escena)."""
+    'outline' (dato = escaleta), 'scene_start' (dato = titulo), 'scene_text' (dato = texto parcial
+    que se va escribiendo), 'scene_done' (dato = escena)."""
     import traceback
 
     tok, model = load_llm()   # en caché: no se recarga en cada generación
@@ -1091,6 +1670,10 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
                 )
 
                 inputs = tok([prompt], return_tensors="pt").to(DEVICE)
+                streamer = None
+                if on_event:
+                    streamer = _make_streamer(
+                        tok, lambda partial, i=i: on_event("scene_text", i, _clean_prose(partial)))
                 with torch.inference_mode():
                     out = model.generate(
                         **inputs,
@@ -1098,7 +1681,8 @@ def generate_story(idea: str, genre: str, on_event=None) -> tuple[dict, bool]:
                         do_sample=True,
                         temperature=temp,
                         top_p=0.9,
-                        repetition_penalty=1.05
+                        repetition_penalty=1.05,
+                        streamer=streamer
                     )
 
                 candidate = _clean_prose(tok.decode(
@@ -1177,57 +1761,93 @@ def build_image_prompt(pipe, parts: list) -> str:
     return ", ".join(chosen)
 
 
-def generate_scene_images(story: dict, genre: str, style: str, progress_cb, preview_cb=None) -> list[Path]:
+def latents_to_preview(latents, size: int = 512):
+    """Vista previa casi gratis de los latents (SD 1.5, 4 canales) -> RGB.
+    Es una aproximación lineal (sin pasar por el VAE): colores aproximados, y como
+    el latent es 64x64 se ve literalmente pixel por pixel."""
+    from PIL import Image
+    w = torch.tensor([[60, -60, 25, -70],
+                      [60,  -5, 15, -50],
+                      [60,  10, -5, -35]], dtype=torch.float32).T      # (4, 3)
+    b = torch.tensor([150, 140, 130], dtype=torch.float32)
+    lat = latents[0].detach().float().cpu()                            # (4, h, w)
+    rgb = torch.einsum("lxy,lr->rxy", lat, w) + b[:, None, None]
+    arr = rgb.clamp(0, 255).byte().numpy().transpose(1, 2, 0)
+    return Image.fromarray(arr).resize((size, size), resample=Image.NEAREST)
+
+
+def generate_scene_images(story: dict, genre: str, style: str, progress_cb,
+                          preview_cb=None, step_cb=None) -> list[Path]:
     import traceback
     from PIL import Image
     from diffusers import LCMScheduler
 
-    pipe = load_image_pipe()          # en caché: no se recarga en cada generación
-    img2img = load_img2img_pipe()     # en caché y comparte pesos con pipe
+    pipe = load_image_pipe()          
+    img2img = load_img2img_pipe()     
 
     # <-- CAMBIO A: parámetros según el scheduler realmente activo
     lcm_ok = isinstance(pipe.scheduler, LCMScheduler)
     steps = IMG_STEPS if lcm_ok else IMG_STEPS_FALLBACK
     refine_steps = IMG_REFINE_STEPS if lcm_ok else IMG_STEPS_FALLBACK
     guidance = IMG_GUIDANCE if lcm_ok else IMG_GUIDANCE_FALLBACK
-    negative = NEGATIVE_PROMPT if guidance > 1.0 else None   # sin CFG no se usa
+    negative = (NEGATIVE_PROMPT + ", " + STYLE_NEGATIVE.get(style, "")) if guidance > 1.0 else None
 
-    visual = GENRES[genre]["visual"]
-    style_en = STYLE_EN.get(style, "digital painting")
+    mood = GENRES[genre].get("mood", GENRES[genre]["visual"])
+    style_prompt = STYLE_PROMPT.get(style, STYLE_EN.get(style, "digital painting"))
     paths = []
     debug_lines = []
 
     for i, scene in enumerate(story["scenes"], 1):
-        # <-- CAMBIO C: orden por prioridad (acción > personaje > estilo > género > escenario)
+        
         prompt = build_image_prompt(pipe, [
+            style_prompt,            # el estilo elegido manda: va primero
             scene["action"],
             story["character"],
-            style_en,
-            visual,
+            mood,
             story["setting"],
-            "masterpiece, highly detailed",
+            "highly detailed",
         ])
 
         generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
 
-        # --- FASE 1: generación base con LCM ---
+        # --- FASE 1: generación base con LCM (con vista previa en cada paso) ---
+        base_kwargs = dict(
+            prompt=prompt,
+            negative_prompt=negative,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            height=IMG_SIZE,
+            width=IMG_SIZE,
+            generator=generator,
+        )
+
+        if step_cb:
+            step_cb(i, 0, steps, None)       # lienzo en blanco de esta escena
+
+            def _on_step(_pipe, step, _t, kw, _i=i):
+                step_cb(_i, step + 1, steps, latents_to_preview(kw["latents"], IMG_SIZE))
+                return kw
+
+            base_kwargs.update(callback_on_step_end=_on_step,
+                               callback_on_step_end_tensor_inputs=["latents"])
+
         with torch.inference_mode():
-            base = pipe(
-                prompt=prompt,
-                negative_prompt=negative,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                height=IMG_SIZE,
-                width=IMG_SIZE,
-                generator=generator
-            ).images[0]
+            try:
+                base = pipe(**base_kwargs).images[0]
+            except TypeError as e:
+                # diffusers antiguo sin callback_on_step_end: se genera sin vista previa
+                if "callback_on_step_end" not in str(e):
+                    raise
+                base_kwargs.pop("callback_on_step_end", None)
+                base_kwargs.pop("callback_on_step_end_tensor_inputs", None)
+                generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
+                base_kwargs["generator"] = generator
+                base = pipe(**base_kwargs).images[0]
 
         if preview_cb:
             preview_cb(i, base)   # boceto base 512 para mostrarlo en el libro
 
-        # --- FASE 2: refinado img2img a mayor resolución (hires fix) ---
-        # <-- CAMBIO B: el img2img toma el tamaño de la imagen de entrada,
-        #     por eso se escala la base a 768 antes de refinar.
+        # --- FASE 2: refinado img2img a mayor resolución.
         try:
             base_up = base.resize((IMG_REFINE_SIZE, IMG_REFINE_SIZE), resample=Image.LANCZOS)
             ref_generator = torch.Generator(device=DEVICE).manual_seed(IMG_SEED + i * 150)
@@ -1262,40 +1882,60 @@ def generate_scene_images(story: dict, genre: str, style: str, progress_cb, prev
 
     return paths
 
-
 # ============================================================
 # 3. VOZ (KOKORO)
 # ============================================================
 
-def generate_narrations(story: dict, progress_cb) -> list[Path]:
+def _resolve_voice(pipeline, mix: dict):
+    """Mezcla voces de Kokoro con pesos (p. ej. 55% em_santa + 45% em_alex).
+    Si algo falla devuelve la voz base para que la narración nunca se caiga."""
+    try:
+        total = sum(mix.values())
+        voice = sum(pipeline.load_voice(name) * w for name, w in mix.items()) / total
+        return voice.float()
+    except Exception:
+        return KOKORO_VOICE
+
+
+def generate_narrations(story: dict, progress_cb, genre: str = "Fantasía") -> list[Path]:
     pipeline = load_kokoro()   # <-- en caché: no se recarga en cada generación
     paths = []
+
+    cfg = GENRE_VOICE.get(genre, GENRE_VOICE["Fantasía"])
+    voice = _resolve_voice(pipeline, cfg["mix"])
+    speed = cfg["speed"]
+    pause = cfg["pause"]
+    rng = np.random.default_rng(7)   # variación pequeña y repetible en las pausas
 
     for i, scene in enumerate(story["scenes"], 1):
         chunks = []
         with torch.inference_mode():
-            for _, _, audio in pipeline(
+            for gs, _, audio in pipeline(
                 scene["text"],
-                voice=KOKORO_VOICE,
-                speed=KOKORO_SPEED,
+                voice=voice,
+                speed=speed,
                 split_pattern=r"(?<=[.!?…])\s+"
             ):
                 if audio is not None:
                     chunks.append(audio.detach().cpu().numpy().astype(np.float32).reshape(-1))
-                    # Pausa entre frase y frase (SENTENCE_PAUSE segundos)
-                    chunks.append(np.zeros(int(24000 * SENTENCE_PAUSE), dtype=np.float32))
+                    # Pausa entre frases con variación natural (una pausa idéntica suena a robot);
+                    # más larga tras puntos suspensivos, interrogaciones y exclamaciones.
+                    end = str(gs).rstrip()[-1:]
+                    mult = 1.5 if end in "…?!" else 1.0
+                    gap = pause * mult * float(rng.uniform(0.8, 1.3))
+                    chunks.append(np.zeros(int(24000 * gap), dtype=np.float32))
 
         if not chunks:
             raise RuntimeError(f"Kokoro no produjo audio para la escena {i}.")
 
         # Pausa de respiración al final de la escena
-        chunks.append(np.zeros(int(24000 * SCENE_END_PAUSE), dtype=np.float32))
+        chunks.append(np.zeros(int(24000 * (SCENE_END_PAUSE + pause * 0.5)), dtype=np.float32))
 
         waveform = np.concatenate(chunks)
         path = OUT_DIR / f"voz_{i}.wav"
         sf.write(str(path), waveform, 24000, subtype="PCM_16")
         paths.append(path)
-        progress_cb(i)
+        progress_cb(i, path)
 
     return paths
 
@@ -1328,7 +1968,7 @@ def _words_html(text: str, animate: bool, cursor: bool) -> str:
     return out
 
 
-def render_book_live(slot, idx, scene, steps, image_uri=None, img_mode="none",
+def render_book_live(slot, idx, scene, image_uri=None, img_mode="none",
                      draft_uri=None, text_mode="none", turn=False):
     """Dibuja el libro abierto en la escena `idx`.
     scene: {"title","text"} (text puede ir vacio mientras se escribe) o None
@@ -1342,35 +1982,522 @@ def render_book_live(slot, idx, scene, steps, image_uri=None, img_mode="none",
         left = (f'<div class="img-stack"><img class="under" src="{draft_uri}" />'
                 f'<img class="img-reveal" src="{image_uri}" /></div>')
     elif image_uri:
-        cls = {"draft": "img-draft", "reveal": "img-reveal"}.get(img_mode, "")
+        cls = {"draft": "img-draft", "reveal": "img-reveal", "step": "img-step"}.get(img_mode, "")
         left = f'<img class="{cls}" src="{image_uri}" />'
     else:
         left = '<div class="slot-empty"><span>LIENZO<br>EN BLANCO</span></div>'
 
     # --- pagina derecha: narracion ---
     if text:
-        right = "<p>" + _words_html(text, text_mode == "write", text_mode == "write") + "</p>"
+        if text_mode == "stream":
+            body = html.escape(text) + ' <span class="cursor"></span>'
+        else:
+            body = _words_html(text, text_mode == "write", text_mode == "write")
+        right = "<p>" + body + "</p>"
     else:
         right = '<div class="slot-empty"><span>ESCRIBIENDO...</span></div>'
-
-    chips = "".join(
-        f'<div class="wip-step{" active" if k == idx else ""}"><b>{k + 1}</b>'
-        f'<i class="{"on" if s["t"] else ""}">T</i>'
-        f'<i class="{"on" if s["i"] else ""}">I</i>'
-        f'<i class="{"on" if s["v"] else ""}">V</i></div>'
-        for k, s in enumerate(steps)
-    )
 
     # Todo en una sola linea: una linea en blanco rompería el bloque HTML de markdown.
     slot.markdown(
         f'<div class="book book-live{" turn" if turn else ""}">'
         f'<div class="paper"><h2>{title}</h2>{left}<div class="pnum">PAG {idx * 2 + 1}</div></div>'
         f'<div class="paper"><h2>Escena {idx + 1} / {N_SCENES}</h2>{right}<div class="pnum">PAG {idx * 2 + 2}</div></div>'
-        f'</div>'
-        f'<div class="wip-steps">{chips}</div>'
-        f'<div class="wip-legend">T = texto &nbsp; I = ilustración &nbsp; V = voz</div>',
+        f'</div>',
         unsafe_allow_html=True
     )
+
+
+# ============================================================
+# GENERACION EN SEGUNDO PLANO + VISTA EN VIVO CON TIRA CLICABLE
+# El libro se crea en un hilo aparte (BookJob). La interfaz lo
+# consulta cada ~1.5 s dentro de un fragmento: asi los botones de
+# la tira de escenas responden SIN interrumpir la generacion.
+# (requiere streamlit >= 1.37 por st.fragment)
+# ============================================================
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment")
+
+# El hilo no tiene ScriptRunContext: es normal, silenciamos el aviso.
+for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+           "streamlit.runtime.scriptrunner.script_run_context"):
+    logging.getLogger(_n).setLevel(logging.ERROR)
+
+
+class JobCancelled(BaseException):
+    """El usuario cancelo (BaseException para que ningun `except Exception` la trague)."""
+
+
+class BookJob:
+    """Estado compartido entre el hilo generador y la interfaz (nunca llama a st.*)."""
+
+    def __init__(self, idea: str, genre: str, style: str):
+        self.idea, self.genre, self.style = idea, genre, style
+        self.lock = threading.RLock()
+        self.thread = None
+        self.cancel = False
+        self.status = "running"          # running | done | error | cancelled
+        self.error = None
+        self.used_fallback = False
+        self.note = "Trazando la escaleta de la historia..."
+        self.steps = [{"t": False, "i": False, "v": False} for _ in range(N_SCENES)]
+        self.scenes = [None] * N_SCENES  # {"title","text"} cuando el texto esta listo
+        self.drafts = {}                 # k -> boceto (uri)
+        self.thumbs = {}                 # k -> ilustracion final liviana (uri)
+        self.voices = {}                 # k -> Path del audio
+        self.frame = {"idx": 0, "scene": None, "kw": {}}   # lo que muestra el modo "en vivo"
+        self.story = None
+        self.pdf_path = None
+        self.zip_path = None
+        self.pdf_note = ""
+
+    def set_frame(self, idx, scene, **kw):
+        with self.lock:
+            self.frame = {"idx": idx, "scene": scene, "kw": kw}
+
+    def set_note(self, msg):
+        with self.lock:
+            self.note = msg
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "status": self.status, "note": self.note, "cancel": self.cancel,
+                "steps": [dict(s) for s in self.steps], "scenes": list(self.scenes),
+                "drafts": dict(self.drafts), "thumbs": dict(self.thumbs),
+                "voices": dict(self.voices), "frame": dict(self.frame),
+                "used_fallback": self.used_fallback,
+            }
+
+
+@st.cache_resource(show_spinner=False)
+def _registry() -> dict:
+    """Guarda el trabajo activo (sobrevive a recargar la pagina y evita dos generaciones a la vez)."""
+    return {"job": None}
+
+
+def thumb_uri(path: Path, size: int = 768, quality: int = 82) -> str:
+    """Version liviana de la ilustracion para la vista en vivo (la final sigue en PNG)."""
+    from PIL import Image
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((size, size))
+        return pil_to_uri(im, quality)
+
+
+# ---------- Exportacion: PDF ilustrado + paquete ZIP ----------
+def _safe_name(title: str) -> str:
+    """Nombre de archivo en ASCII (sin tildes ni simbolos) para descargas y ZIP."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^\w\s-]", "", s).strip()
+    return re.sub(r"\s+", "_", s)[:50] or "libro"
+
+
+def _pdf_txt(s: str) -> str:
+    """Las fuentes base del PDF son WinAnsi (cubre espanol); lo demas se reemplaza."""
+    return s.encode("cp1252", "replace").decode("cp1252")
+
+
+_PDF_ACCENT = {"Fantasía": "#ffcd75", "Terror": "#c9303a", "Misterio": "#9fb4e2",
+               "Aventura": "#f7b455", "Ciencia ficción": "#63c74d", "Infantil": "#ff7ba3"}
+
+
+def build_pdf(story: dict, genre: str, out_path: Path) -> None:
+    """Libro en PDF apaisado: portada, una doble pagina por escena y pagina final."""
+    from xml.sax.saxutils import escape
+    from PIL import Image
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.enums import TA_JUSTIFY
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.utils import ImageReader, simpleSplit
+    from reportlab.pdfgen import canvas
+    from reportlab.platypus import Paragraph
+
+    W, H = landscape(A4)
+    ink, navy, cream, edge = HexColor("#181425"), HexColor("#262b44"), HexColor("#f4f4e8"), HexColor("#c0cbdc")
+    accent = HexColor(_PDF_ACCENT.get(genre, "#ffcd75"))
+    c = canvas.Canvas(str(out_path), pagesize=(W, H))
+    c.setTitle(_pdf_txt(story["title"]))
+    c.setAuthor("ETER | Relatos que cobran vida")
+
+    # --- portada ---
+    c.setFillColor(HexColor("#181425")); c.rect(0, 0, W, H, stroke=0, fill=1)
+    c.setStrokeColor(accent); c.setLineWidth(6); c.rect(30, 30, W - 60, H - 60, stroke=1, fill=0)
+    c.setFillColor(HexColor("#8b9bb4")); c.setFont("Courier-Bold", 13)
+    c.drawCentredString(W / 2, H - 110, "EDICION LITERARIA ILUSTRADA")
+    c.setFillColor(accent); c.setFont("Courier-Bold", 34)
+    lines = simpleSplit(_pdf_txt(story["title"]).upper(), "Courier-Bold", 34, W - 160)
+    y = H / 2 + 20 * len(lines)
+    for ln in lines:
+        c.drawCentredString(W / 2, y, ln)
+        y -= 44
+    c.setFillColor(HexColor("#a5e06b")); c.setFont("Courier-Bold", 15)
+    c.drawCentredString(W / 2, 90, _pdf_txt(f"Genero: {genre}"))
+    c.setFillColor(HexColor("#8b9bb4")); c.setFont("Courier", 11)
+    c.drawCentredString(W / 2, 62, "ETER | Relatos que cobran vida")
+    c.showPage()
+
+    # --- escenas: doble pagina (ilustracion | texto) ---
+    mx, my, gap = 28, 28, 14
+    pw, ph = (W - 2 * mx - gap) / 2, H - 2 * my
+    pad = 22
+    n = len(story["scenes"])
+    for i, sc in enumerate(story["scenes"]):
+        c.setFillColor(navy); c.rect(0, 0, W, H, stroke=0, fill=1)
+        for px0 in (mx, mx + pw + gap):
+            c.setFillColor(cream); c.rect(px0, my, pw, ph, stroke=0, fill=1)
+            c.setStrokeColor(edge); c.setLineWidth(3); c.rect(px0 + 3, my + 3, pw - 6, ph - 6, stroke=1, fill=0)
+
+        # izquierda: titulo + ilustracion
+        c.setFillColor(ink); c.setFont("Courier-Bold", 14)
+        tl = simpleSplit(_pdf_txt(sc["title"]).upper(), "Courier-Bold", 14, pw - 2 * pad)
+        ty = my + ph - 34
+        for ln in tl:
+            c.drawCentredString(mx + pw / 2, ty, ln)
+            ty -= 18
+        c.setStrokeColor(edge); c.setLineWidth(2); c.line(mx + pad, ty + 8, mx + pw - pad, ty + 8)
+        with Image.open(sc["image"]) as im:
+            im = im.convert("RGB")
+            im.thumbnail((1000, 1000))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=88)
+        buf.seek(0)
+        side = min(pw - 2 * pad, ty - my - 50)
+        ix, iy = mx + (pw - side) / 2, ty - 18 - side
+        c.setFillColor(HexColor("#8b4049")); c.rect(ix + 4, iy - 4, side, side, stroke=0, fill=1)
+        c.drawImage(ImageReader(buf), ix, iy, side, side)
+        c.setStrokeColor(ink); c.setLineWidth(3); c.rect(ix, iy, side, side, stroke=1, fill=0)
+        c.setFillColor(HexColor("#8b9bb4")); c.setFont("Courier-Bold", 9)
+        c.drawRightString(mx + pw - 16, my + 12, f"PAG {i * 2 + 1}")
+
+        # derecha: cabecera + texto (la letra se ajusta para que siempre quepa)
+        rx = mx + pw + gap
+        c.setFillColor(ink); c.setFont("Courier-Bold", 14)
+        c.drawCentredString(rx + pw / 2, my + ph - 34, f"ESCENA {i + 1} / {n}")
+        c.setStrokeColor(edge); c.setLineWidth(2); c.line(rx + pad, my + ph - 42, rx + pw - pad, my + ph - 42)
+        tw, th = pw - 2 * pad, ph - 100
+        body = escape(_pdf_txt(sc["text"]))
+        for fs in (15, 14, 13, 12, 11, 10, 9):
+            style = ParagraphStyle("t", fontName="Times-Roman", fontSize=fs, leading=fs * 1.4,
+                                   alignment=TA_JUSTIFY, textColor=ink)
+            para = Paragraph(body, style)
+            _, h = para.wrap(tw, th)
+            if h <= th:
+                break
+        para.drawOn(c, rx + pad, my + ph - 58 - h)
+        c.setFillColor(HexColor("#8b9bb4")); c.setFont("Courier-Bold", 9)
+        c.drawRightString(rx + pw - 16, my + 12, f"PAG {i * 2 + 2}")
+        c.showPage()
+
+    # --- final ---
+    c.setFillColor(HexColor("#181425")); c.rect(0, 0, W, H, stroke=0, fill=1)
+    c.setFillColor(accent); c.setFont("Courier-Bold", 40)
+    c.drawCentredString(W / 2, H / 2, "FIN")
+    c.setFillColor(HexColor("#8b9bb4")); c.setFont("Courier", 11)
+    c.drawCentredString(W / 2, H / 2 - 36, "ETER | Relatos que cobran vida")
+    c.showPage()
+    c.save()
+
+
+def build_zip(story: dict, out_path: Path, pdf_path=None) -> None:
+    """Paquete completo: texto, ilustraciones, narracion en audio y (si existe) el PDF."""
+    base = _safe_name(story["title"])
+    txt = [story["title"], "=" * len(story["title"]), ""]
+    for i, sc in enumerate(story["scenes"], 1):
+        txt += [f"Escena {i}: {sc['title']}", "", sc["text"], ""]
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{base}/libro.txt", "\n".join(txt))
+        z.writestr(f"{base}/historia.json", json.dumps(story, ensure_ascii=False, indent=2))
+        for i, sc in enumerate(story["scenes"], 1):
+            z.write(sc["image"], f"{base}/escena_{i}.png", compress_type=zipfile.ZIP_STORED)
+            z.write(sc["voice"], f"{base}/voz_{i}.wav")
+        if pdf_path and Path(pdf_path).exists():
+            z.write(pdf_path, f"{base}/{base}.pdf", compress_type=zipfile.ZIP_STORED)
+
+
+def build_downloads(job: "BookJob", story: dict) -> None:
+    base = _safe_name(story["title"])
+    try:
+        pdf = OUT_DIR / f"{base}.pdf"
+        build_pdf(story, job.genre, pdf)
+        job.pdf_path = pdf
+    except ImportError:
+        job.pdf_note = "Para exportar a PDF instala reportlab:  pip install reportlab"
+    except Exception:
+        job.pdf_note = "No se pudo crear el PDF (el paquete .zip sí está disponible)."
+        try:
+            (OUT_DIR / "debug_pdf.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            pass
+    zp = OUT_DIR / f"{base}.zip"
+    build_zip(story, zp, job.pdf_path)
+    job.zip_path = zp
+
+
+# ---------- Hilo generador ----------
+def run_book_job(job: BookJob) -> None:
+    def check():
+        if job.cancel:
+            raise JobCancelled()
+
+    try:
+        torch.set_num_threads(TORCH_THREADS)
+        job.set_frame(0, None)
+
+        # --- Fase 1: texto, escena por escena ---
+        titles = {}
+
+        def on_story_event(ev, i, data):
+            check()
+            if ev == "scene_start":
+                titles[i] = data
+                job.set_frame(i, {"title": data, "text": ""}, turn=True)
+                job.set_note(f"Escribiendo la escena {i + 1}/{N_SCENES}...")
+            elif ev == "scene_text":
+                # texto real que el modelo va escribiendo, con cursor parpadeando
+                job.set_frame(i, {"title": titles.get(i, "..."), "text": data}, text_mode="stream")
+            elif ev == "scene_done":
+                with job.lock:
+                    job.steps[i]["t"] = True
+                    job.scenes[i] = {"title": data["title"], "text": data["text"]}
+                job.set_frame(i, data, text_mode="done")
+
+        story, used_fallback = generate_story(job.idea, job.genre, on_event=on_story_event)
+        check()
+        job.used_fallback = used_fallback
+        scenes = story["scenes"]
+        with job.lock:
+            for k, sc in enumerate(scenes):
+                job.steps[k]["t"] = True
+                job.scenes[k] = {"title": sc["title"], "text": sc["text"]}
+
+        # --- Fase 2: ilustraciones (boceto -> pintado) ---
+        job.set_frame(0, scenes[0], text_mode="done", turn=True)
+        job.set_note("Ilustrando la escena 1...")
+
+        def on_img_preview(i, pil_img):
+            check()
+            uri = pil_to_uri(pil_img)
+            with job.lock:
+                job.drafts[i - 1] = uri
+            job.set_frame(i - 1, scenes[i - 1], image_uri=uri, img_mode="draft",
+                          text_mode="done", turn=True)
+            job.set_note(f"Escena {i}: boceto listo, refinando detalles...")
+
+        def on_img_done(i, path):
+            check()
+            thumb = thumb_uri(path)
+            with job.lock:
+                job.thumbs[i - 1] = thumb
+                job.steps[i - 1]["i"] = True
+            job.set_frame(i - 1, scenes[i - 1], image_uri=thumb, img_mode="reveal",
+                          draft_uri=job.drafts.get(i - 1), text_mode="done")
+            job.set_note(f"Escena {i}: ilustración pintada.")
+
+        def on_img_step(i, step, total, pil_img):
+            check()
+            if pil_img is None:   # empieza la imagen de la escena i: lienzo en blanco
+                job.set_frame(i - 1, scenes[i - 1], text_mode="done", turn=(i > 1))
+                job.set_note(f"Escena {i}: preparando el lienzo...")
+                return
+            job.set_frame(i - 1, scenes[i - 1], image_uri=pil_to_uri(pil_img, 80),
+                          img_mode="step", text_mode="done")
+            job.set_note(f"Escena {i}: dibujando la imagen, paso {step}/{total}...")
+
+        images = generate_scene_images(story, job.genre, job.style, on_img_done,
+                                       preview_cb=on_img_preview, step_cb=on_img_step)
+        check()
+
+        # --- Fase 3: voz (el libro pasa de pagina escena por escena) ---
+        job.set_frame(0, scenes[0], image_uri=job.thumbs.get(0), img_mode="done",
+                      text_mode="done", turn=True)
+        job.set_note("Narrando la escena 1...")
+
+        def on_voice_done(i, path):
+            check()
+            with job.lock:
+                job.voices[i - 1] = path
+                job.steps[i - 1]["v"] = True
+            nxt = min(i, N_SCENES - 1)
+            job.set_frame(nxt, scenes[nxt], image_uri=job.thumbs.get(nxt), img_mode="done",
+                          text_mode="done", turn=(i < N_SCENES))
+            job.set_note(f"Escena {i}: voz lista." if i == N_SCENES else f"Narrando la escena {i + 1}...")
+
+        voices = generate_narrations(story, on_voice_done, genre=job.genre)
+        check()
+
+        # --- Cierre: historia.json + archivos descargables ---
+        for i, sc in enumerate(story["scenes"]):
+            sc["image"] = str(images[i])
+            sc["voice"] = str(voices[i])
+        (OUT_DIR / "historia.json").write_text(
+            json.dumps(story, ensure_ascii=False, indent=2), encoding="utf-8")
+        job.set_note("Encuadernando el libro (PDF y paquete descargable)...")
+        build_downloads(job, story)
+        job.story = story
+        job.set_note("¡Libro encuadernado!")
+        job.status = "done"
+    except JobCancelled:
+        job.status = "cancelled"
+    except Exception:
+        job.error = traceback.format_exc()
+        job.status = "error"
+
+
+# ---------- Interfaz de la generacion ----------
+def _pin_scene(k: int):
+    st.session_state.pinned = k
+
+
+def _follow_live():
+    st.session_state.pinned = None
+
+
+def _cancel_job():
+    job = st.session_state.get("job")
+    if job:
+        job.cancel = True
+
+
+def _open_finished_book(job: BookJob):
+    st.session_state.book = {
+        "story": job.story, "genre": job.genre, "idea": job.idea,
+        "pdf": str(job.pdf_path) if job.pdf_path else None,
+        "zip": str(job.zip_path) if job.zip_path else None,
+        "pdf_note": job.pdf_note,
+    }
+    st.session_state.page = -1
+    st.session_state.screen = "book"
+    st.session_state.job = None
+    st.session_state.pinned = None
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _file_bytes(path: str, mtime: float) -> bytes:
+    return Path(path).read_bytes()
+
+
+def render_downloads(pdf, zip_, pdf_note="", key="dl"):
+    """Botones de descarga (solo cuando TODO el libro ya existe)."""
+    pdf_ok = bool(pdf) and Path(pdf).exists()
+    zip_ok = bool(zip_) and Path(zip_).exists()
+    if not (pdf_ok or zip_ok):
+        return
+    st.markdown('<div class="audio-label">DESCARGAR LIBRO</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    if pdf_ok:
+        p = Path(pdf)
+        c1.download_button("📄 DESCARGAR PDF", data=_file_bytes(str(p), p.stat().st_mtime),
+                           file_name=p.name, mime="application/pdf",
+                           use_container_width=True, key=f"{key}_pdf",
+                           help="Libro ilustrado listo para leer o imprimir")
+    elif pdf_note:
+        c1.caption(pdf_note)
+    if zip_ok:
+        z = Path(zip_)
+        c2.download_button("🎧 PAQUETE COMPLETO (.zip)", data=_file_bytes(str(z), z.stat().st_mtime),
+                           file_name=z.name, mime="application/zip",
+                           use_container_width=True, key=f"{key}_zip",
+                           help="Texto, ilustraciones, narración en audio y PDF")
+
+
+def _pinned_frame(snap: dict, k: int) -> dict:
+    """Cuadro del libro para una escena elegida con la tira (muestra lo que ya existe)."""
+    uri, mode = snap["thumbs"].get(k), "done"
+    if not uri and snap["drafts"].get(k):
+        uri, mode = snap["drafts"][k], "draft"
+    kw = {"text_mode": "done"}
+    if uri:
+        kw.update(image_uri=uri, img_mode=mode)
+    return {"idx": k, "scene": snap["scenes"][k], "kw": kw}
+
+
+def _scene_strip(snap: dict, pinned):
+    """Tira de progreso: un boton por escena (T texto, I ilustracion, V voz)."""
+    mark = lambda ok: "🟩" if ok else "⬜"
+    try:
+        box = st.container(key="strip")
+    except TypeError:            # streamlit < 1.39 no admite key= en containers
+        box = st.container()
+    with box:
+        cols = st.columns(N_SCENES + 1, gap="small")
+        for k in range(N_SCENES):
+            s = snap["steps"][k]
+            cols[k].button(
+                f"{k + 1}  T{mark(s['t'])} I{mark(s['i'])} V{mark(s['v'])}",
+                key=f"chip_{k}", on_click=_pin_scene, args=(k,),
+                disabled=not s["t"], use_container_width=True,
+                type="primary" if pinned == k else "secondary",
+                help="Volver a esta escena" if s["t"] else "Esta escena aún no está lista",
+            )
+        cols[N_SCENES].button(
+            "📡 EN VIVO", key="chip_live", on_click=_follow_live, use_container_width=True,
+            type="primary" if pinned is None else "secondary",
+            help="Seguir la escena que se está creando ahora",
+        )
+    st.markdown(
+        '<div class="wip-legend">T = texto &nbsp; I = ilustración &nbsp; V = voz &nbsp;·&nbsp; '
+        '🟩 listo &nbsp; ⬜ en espera &nbsp;·&nbsp; toca una escena para volver a verla</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _generation_ui(polling: bool):
+    job = st.session_state.get("job")
+    if job is None:
+        return
+    snap = job.snapshot()
+    status = snap["status"]
+    if polling and status != "running":
+        st.rerun()    # el trabajo termino: repinta la pagina completa (sin sondeo)
+
+    pinned = st.session_state.get("pinned")
+    if pinned is not None and not snap["scenes"][pinned]:
+        pinned = None
+
+    total = N_SCENES * 3
+    done = sum(int(s[k]) for s in snap["steps"] for k in ("t", "i", "v"))
+    if status == "running" and snap["cancel"]:
+        label = "Cancelando... terminando el paso en curso"
+    elif status == "done":
+        label = "¡Libro terminado!"
+    else:
+        label = f"Creando tu obra literaria... {done}/{total} pasos"
+    st.progress(done / total, text=label)
+    st.markdown(f'<div class="audio-label">{html.escape(snap["note"])}</div>', unsafe_allow_html=True)
+    if snap["used_fallback"]:
+        st.warning("Se usó un relato base alternativo por contingencia.")
+
+    fr = _pinned_frame(snap, pinned) if pinned is not None else snap["frame"]
+    render_book_live(st, fr["idx"], fr["scene"], **fr["kw"])
+
+    if pinned is not None and pinned in snap["voices"]:
+        st.markdown('<div class="audio-label">NARRACIÓN DE VOZ</div>', unsafe_allow_html=True)
+        st.audio(str(snap["voices"][pinned]))
+
+    _scene_strip(snap, pinned)
+
+    if status == "running":
+        _, mid, _ = st.columns([1, 1, 1])
+        mid.button("⛔ CANCELAR", key="gen_cancel", on_click=_cancel_job,
+                   disabled=snap["cancel"], use_container_width=True)
+    elif status == "done":
+        st.markdown('<div class="audio-label">¡LIBRO ENCUADERNADO! ÁBRELO O DESCÁRGALO</div>',
+                    unsafe_allow_html=True)
+        if st.button("📖 ABRIR LIBRO", key="gen_open", use_container_width=True):
+            _open_finished_book(job)
+            st.rerun()
+        render_downloads(job.pdf_path, job.zip_path, job.pdf_note, key="dl_gen")
+
+
+@_fragment(run_every=0.8)
+def generation_view_live():
+    _generation_ui(polling=True)
+
+
+@_fragment
+def generation_view_static():
+    _generation_ui(polling=False)
 
 
 # ============================================================
@@ -1381,7 +2508,9 @@ for k, v in {
     "screen": "welcome",
     "book": None,
     "page": -1,
-    "narration_auto": True
+    "narration_auto": True,
+    "job": None,
+    "pinned": None
 }.items():
     st.session_state.setdefault(k, v)
 
@@ -1501,8 +2630,18 @@ elif st.session_state.screen == "studio":
     st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
     _, btn_col, _ = st.columns([1, 2, 1])
 
+    active_job = _registry()["job"]
+    busy = active_job is not None and active_job.status == "running"
+
     with btn_col:
-        crear_libro = st.button("⚡ GENERAR LIBRO", use_container_width=True)
+        crear_libro = st.button("⚡ GENERAR LIBRO", use_container_width=True, disabled=busy)
+        if busy:
+            st.markdown('<div class="audio-label">YA HAY UN LIBRO GENERÁNDOSE</div>', unsafe_allow_html=True)
+            if st.button("↩ VOLVER A LA GENERACIÓN", key="resume_job", use_container_width=True):
+                st.session_state.job = active_job
+                st.session_state.pinned = None
+                st.session_state.screen = "generating"
+                st.rerun()
 
     if crear_libro:
         if not idea.strip():
@@ -1512,98 +2651,54 @@ elif st.session_state.screen == "studio":
                 shutil.rmtree(OUT_DIR)
             OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-            with st.status("Creando tu obra literaria…", expanded=True) as status:
-                # El libro real formándose en vivo, escena por escena
-                book_slot = st.empty()
-                note_slot = st.empty()
-                steps = [{"t": False, "i": False, "v": False} for _ in range(N_SCENES)]
-                drafts = {}
-
-                def show(idx, scene, **kw):
-                    render_book_live(book_slot, idx, scene, steps, **kw)
-
-                def note(msg):
-                    note_slot.markdown(f'<div class="audio-label">{html.escape(msg)}</div>',
-                                       unsafe_allow_html=True)
-
-                # --- Fase 1: texto, escena por escena ---
-                show(0, None)
-                note("Trazando la escaleta de la historia...")
-
-                def on_story_event(ev, i, data):
-                    if ev == "scene_start":
-                        show(i, {"title": data, "text": ""}, turn=True)
-                        note(f"Escribiendo la escena {i + 1}/{N_SCENES}...")
-                    elif ev == "scene_done":
-                        steps[i]["t"] = True
-                        show(i, data, text_mode="write")
-
-                story, used_fallback = generate_story(idea.strip(), genre, on_event=on_story_event)
-
-                if used_fallback:
-                    st.warning("Se usó un relato base alternativo por contingencia.")
-                    for s in steps:
-                        s["t"] = True
-
-                scenes = story["scenes"]
-
-                # --- Fase 2: ilustraciones (boceto -> pintado) ---
-                bar_img = st.progress(0, text="Ilustrando escenas (base 512 + refinado 768)...")
-                show(0, scenes[0], text_mode="done", turn=True)
-                note("Ilustrando la escena 1...")
-
-                def on_img_preview(i, pil_img):
-                    drafts[i] = pil_to_uri(pil_img)
-                    show(i - 1, scenes[i - 1], image_uri=drafts[i], img_mode="draft",
-                         text_mode="done", turn=True)
-                    note(f"Escena {i}: boceto listo, refinando detalles...")
-
-                def on_img_done(i, path):
-                    steps[i - 1]["i"] = True
-                    show(i - 1, scenes[i - 1], image_uri=img_to_uri(path), img_mode="reveal",
-                         draft_uri=drafts.get(i), text_mode="done")
-                    note(f"Escena {i}: ilustración pintada.")
-                    bar_img.progress(i / N_SCENES, text=f"Ilustración {i}/{N_SCENES}")
-
-                images = generate_scene_images(story, genre, style, on_img_done, preview_cb=on_img_preview)
-
-                # --- Fase 3: voz (el libro pasa de página escena por escena) ---
-                bar_voice = st.progress(0, text="Sintetizando voz narradora...")
-                show(0, scenes[0], image_uri=img_to_uri(images[0]), img_mode="done",
-                     text_mode="done", turn=True)
-                note("Narrando la escena 1...")
-
-                def on_voice_done(i):
-                    steps[i - 1]["v"] = True
-                    nxt = min(i, N_SCENES - 1)
-                    show(nxt, scenes[nxt], image_uri=img_to_uri(images[nxt]), img_mode="done",
-                         text_mode="done", turn=(i < N_SCENES))
-                    note(f"Escena {i}: voz lista." if i == N_SCENES else f"Narrando la escena {i + 1}...")
-                    bar_voice.progress(i / N_SCENES, text=f"Voz {i}/{N_SCENES}")
-
-                voices = generate_narrations(story, on_voice_done)
-
-                for i, sc in enumerate(story["scenes"]):
-                    sc["image"] = str(images[i])
-                    sc["voice"] = str(voices[i])
-
-                (OUT_DIR / "historia.json").write_text(
-                    json.dumps(story, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
-                )
-
-                note("¡Libro encuadernado!")
-                status.update(label="¡Aventura lista!", state="complete")
-                time.sleep(1.2)
-
-            st.session_state.book = {
-                "story": story,
-                "genre": genre,
-                "idea": idea.strip()
-            }
-            st.session_state.page = -1
-            st.session_state.screen = "book"
+            job = BookJob(idea.strip(), genre, style)
+            job.thread = threading.Thread(target=run_book_job, args=(job,), daemon=True, name="eter-book-job")
+            _registry()["job"] = job
+            st.session_state.job = job
+            st.session_state.pinned = None
+            st.session_state.screen = "generating"
+            job.thread.start()
             st.rerun()
+
+# ============================================================
+# PANTALLA 2B: GENERANDO (el libro se forma en vivo; la tira es clicable)
+# ============================================================
+elif st.session_state.screen == "generating":
+    job = st.session_state.job
+    if job is None:
+        st.session_state.screen = "studio"
+        st.rerun()
+    apply_background(job.genre)
+    st.markdown("""
+    <div style="max-width: 900px; margin: 0 auto 1rem auto; text-align: center;">
+        <div style="font-family: 'Press Start 2P', monospace; font-size: 18px; color: #ffcd75;">
+            FORJANDO TU LIBRO
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if job.status == "cancelled":
+        st.session_state.job = None
+        st.session_state.screen = "studio"
+        st.rerun()
+
+    if job.status == "running":
+        generation_view_live()
+    else:
+        generation_view_static()
+
+    if job.status == "error":
+        st.error("Algo falló durante la generación.")
+        with st.expander("Detalles técnicos"):
+            st.code(job.error or "sin detalles")
+        if st.button("⬅ VOLVER AL ESTUDIO", key="gen_back"):
+            st.session_state.job = None
+            st.session_state.screen = "studio"
+            st.rerun()
+    elif job.status == "done" and st.session_state.pinned is None:
+        time.sleep(1.2)               # deja ver el libro terminado un instante
+        _open_finished_book(job)
+        st.rerun()
 
 # ============================================================
 # PANTALLA 3: LIBRO CON VISUALIZACIÓN RETRO
@@ -1672,6 +2767,8 @@ elif st.session_state.screen == "book":
             st.session_state.screen = "studio"
             st.session_state.page = -1
             st.rerun()
+
+    render_downloads(book.get("pdf"), book.get("zip"), book.get("pdf_note", ""), key="dl_book")
 
     st.session_state.narration_auto = st.toggle(
         "Reproducción automática de voz",
